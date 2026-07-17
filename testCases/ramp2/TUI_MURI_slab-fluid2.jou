@@ -1,0 +1,95 @@
+/file/set-tui-version "25.2"
+
+/mesh/modify-zones/merge-zones 4 5 6
+
+; BC VALUES -- derived from given freestream conditions:
+;   P0 = 5.1091970901089320e+06 Pa, T0 = 1.2787752593014334e+03 K, M = 4.9510068149271147, gamma = 1.4, R = 287.05 J/(kg K)
+; Isentropic relations (flow in +X, inlet normal-to-boundary):
+;   factor    = 1 + (gamma-1)/2 * M^2                    = 5.902493696290946
+;   T_static  = T0 / factor                               = 216.65 K            (-> TEMP_VALUE)
+;   p_static  = P0 / factor^(gamma/(gamma-1))              = 10226.529945057235 Pa (-> PRESSURE_VALUE, both occurrences)
+;   a_static  = sqrt(gamma * R * T_static)                 = 295.06801842964956 m/s
+;   V         = M * a_static                               = 1460.8837701122345 m/s (-> VELOCITY_VALUE)
+; T0_VALUE (outlet backflow total temperature) = T0 given above = 1278.7752593014334 K
+; T_static landing exactly on the US Standard Atmosphere's 216.65 K stratosphere value is a good sanity check.
+
+; PHYSICS
+/define/models/solver/density-based-implicit yes
+
+/define/operating-conditions/operating-pressure 0
+
+/define/models/energy yes
+
+/define/models/viscous/inviscid yes
+
+/define/materials/change-create air air yes ideal-gas no no no no
+
+/define/boundary-conditions/fluid region_1 yes air no no no no 0 no 0 no 0 no 0 no 0 no 0 no no no no
+
+/define/boundary-conditions/zone-type 10 symmetry
+
+/define/boundary-conditions/zone-name 10 back
+
+/define/boundary-conditions/zone-type 9 symmetry
+
+/define/boundary-conditions/zone-name 9 front
+
+/define/boundary-conditions/zone-type 3 velocity-inlet
+
+/define/boundary-conditions/zone-name 3 inlet
+
+/define/boundary-conditions/zone-type interior-region_1 interior
+
+/define/boundary-conditions/zone-type 7 pressure-outlet
+
+/define/boundary-conditions/zone-name 7 outlet
+
+/define/boundary-conditions/zone-type 4 wall
+
+/define/boundary-conditions/zone-name 4 bottom
+
+/define/boundary-conditions/zone-type 8 wall
+
+/define/boundary-conditions/zone-name 8 top
+
+/define/boundary-conditions/velocity-inlet inlet no no yes yes no 1460.8837701122345 no 10226.529945057235 no 216.65 no 10226.529945057235
+
+/define/boundary-conditions/pressure-outlet outlet yes no 10226.529945057235 no 1278.7752593014334 no yes yes yes no no no
+
+/solve/set/flux-type 1
+
+/solve/set/convergence-acceleration-for-stretched-meshes yes
+
+/file/set-idle-timeout yes 1 no
+
+/solve/initialize/hyb-initialization
+/solve/initialize/fmg-initialization yes
+
+/solve/set/high-speed-numerics/enable yes
+
+;/solve/set/courant-number 0.3
+
+; residual convergence: 0.0001 on every monitored residual except Y-velocity,
+; relaxed to 1000000 (effectively disabled) per earlier request. Slot order
+; [continuity, x-velocity, y-velocity, z-velocity, energy] -- the original
+; TOL/TOL/100000/TOL/TOL template already put its one relaxed value in slot 3,
+; consistent with Y-velocity being 3rd, so this reuses the same slot.
+/solve/monitors/residual/convergence-criteria 0.0001 0.0001 1000000 0.0001 0.0001
+/solve/iterate 5000
+
+;ENSIGHT MANUAL -- exports adapted_ramp_fields.encas (+ .geo and per-quantity
+; result files) into Fluent's current working directory at run time. Field
+; list and trailing tokens (". yes (*) () no") are unchanged from the
+; verified pattern (identical in this file and the repo-root example.jou,
+; so trusted over a guess): "yes (*) ()" selects all zones/surfaces for
+; export, and the final "no" is one more Q&A answer whose exact prompt
+; (likely overwrite-existing-file or boundary-only) hasn't been confirmed by
+; a completed local run yet -- every .trn transcript in this directory so
+; far failed earlier in the journal (zone auto-renamed off "wall-3" once its
+; type changed, or a missing adapted.cas), never reaching this line. No
+; adapted_ramp_fields.* files exist here yet, so there's no overwrite
+; conflict on the next run either way; if a rerun later ever silently skips
+; the export, that final token is the first thing to flip.
+/file/export/ensight-gold encasFiles/outAd1.encas pressure mach-number velocity-magnitude sound-speed temperature density dynamic-pressure enthalpy gamma gas-constant . yes (*) () no
+
+exit yes

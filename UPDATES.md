@@ -110,6 +110,68 @@ subprocess. Read this before touching `case_config.json`, `pipeline/`, or
   the new flat schema — needs `native_model`/`model_smd`/`mesh_sms`/
   `run_on_scorec_script`/`work_dir` at the top level, no `scorec` wrapper.
 
+## 3. Feature detection redesign (`feature_extraction.py`)
+
+**Bug that motivated this**: a first attempt at `testCases/wedgePaper`
+placed a shock region at x=0.028, but the real wedge's leading-edge shock
+(confirmed against the actual model geometry + theta-beta-M relations for
+M=6/10°) is near x=0-0.01 — off by ~3x the wedge's own length. Root cause:
+`compute_feature_summary` used **one global gradient-magnitude percentile
+per field, over the whole mesh**. That's not a ramp-specific tuning
+artifact (checked: it isn't — a separate ~600 lines of genuinely ramp2-
+calibrated auto-build machinery in `size_field_builder.py` existed but
+**was never called by `driver.py`**, so it wasn't the cause here; it's been
+removed, see below). It's a structural flaw: once one feature dominates
+the gradient distribution, a single percentile cutoff either merges
+unrelated high-gradient regions into one bogus connected component, or
+hides a weaker-but-real feature entirely.
+
+**Fix — iterative "peel-off" multi-pass detection**: each pass computes its
+percentile only over vertices no earlier pass already claimed as a region,
+then removes what it finds before the next pass. Proven with a synthetic
+self-test (`feature_extraction.py`'s `__main__`): a 1D chain with a strong
+feature (slope 10, 300 vertices) and a weak one (slope 2, 100 vertices) —
+a single 90th-percentile pass only ever finds the strong one (asserted
+directly in the test); the new code finds both, in 2 passes.
+
+**Second bug found immediately after, on real data**: unbounded peel-off
+returned 40-56 "candidate regions" on `ramp2` — real solution fields are
+never perfectly flat away from real features (turbulence/interpolation/
+solver noise), so passes kept finding technically-above-percentile noise
+indefinitely. Fixed with `min_relative_threshold` (default 0.01): stop once
+a pass's threshold drops below 1% of that field's first (strongest) pass —
+a broad two-orders-of-magnitude floor, not tuned to any one case. Brought
+ramp2 down to 11/27 candidate regions across 2-3 passes; re-verified
+`wedgePaper` still produces the *exact same* adapted mesh as before (418
+pts/761 cells) — no regression to the actual adaptation output, since that
+comes from the human-authored `region_spec.json`, not from
+`feature_extraction`'s own region count.
+
+**Configuration values now follow one consistent pattern** (per explicit
+request: choose with stated reasoning, or let the user override) — each of
+`gradient_percentile`, `min_region_size`/`min_region_fraction`,
+`max_detection_passes`, `min_relative_threshold` (feature_extraction.py) and
+`growth_rate`, `background_size` (region_spec.py) has a named default +
+reasoning string constant; `driver.py` prints the reasoning for any value
+NOT overridden in `case_config.json`, and every one is now a validated
+optional `case_config.json` key (see `case_config.py`'s module docstring).
+`region_spec.defaults_from_case_config` and `llm_region_spec.draft_region_spec`
+changed signature accordingly (now return/consume `(defaults, notes)`).
+
+**Dead code removed**: `size_field_builder.py`'s auto-build path
+(`build_auto_size_field`, `detect_gradient_components`, centerline
+extraction/densification/extension/smoothing, ~600 lines) — calibrated
+against ramp2 specifically, never wired into `driver.py`. Recoverable from
+git history if wanted again, but should be re-validated against more than
+one case first. File went from 1012 → 348 lines.
+
+**Known remaining limitation**: `_connected_components_on_mask` still
+fragments a single physical feature into multiple disconnected components
+whenever there's a detection gap (mesh resolution, threshold noise) —
+11-27 regions for two fields on ramp2 is a big improvement over 40-56, but
+still more than a truly "compact" summary; merging nearby same-direction
+components is a reasonable next step if this becomes a problem in practice.
+
 ## Python environment for pipeline/
 
 The system Python here has no working `pip` at all (`python3 -m pip` →
@@ -164,6 +226,21 @@ velocity/etc, matching `ramp-initial.sms`'s vertex count) using
 So this is no longer just structurally ready — the entire
 VTU→features→region_spec→size_field→adapt→VTU/.cas loop has been run for
 real, on real CFD data, on this machine, start to finish.
+
+### Second real case (2D) found and fixed a real bug in the VTU writer
+
+Ran the same full loop against `testCases/wedgePaper/wedge0.vtu` (a genuinely
+2D case — all Z=0, triangle/line cells only, Mach 6 10° wedge). First attempt
+produced `adapted.vtu` with **0 cells** — `writeAdaptedMeshVTU` in
+`apply_aniso_size_field.cpp` only ever walked `M_regionIter` (3D volume
+regions), so a surface-only mesh with no regions at all wrote points but no
+connectivity. Fixed: if `M_regionIter` finds zero regions, it now falls back
+to walking `M_faceIter`/`F_numEdges`/`F_vertices` and writes triangles/quads
+instead (VTK_TRIANGLE=5/VTK_QUAD=9) — only in that no-regions case, since a
+real volume mesh's faces include interior faces shared between two regions
+that would double up the geometry if also written as cells. Re-ran after the
+fix: `adapted.vtu` now has 572 points / 1043 real triangle cells,
+connectivity internally consistent (verified with `xml.etree`).
 
 ## Still open
 - The VTU writer's vertex ordering for pyramid/wedge/hex regions uses

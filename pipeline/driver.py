@@ -54,6 +54,7 @@ import sys
 
 from case_config import load_case_config, CaseConfigError, ADAPTED_VTU_NAME, ADAPTED_CAS_NAME
 from vtu_io import read_vtu
+import feature_extraction
 from feature_extraction import compute_feature_summary
 from region_spec import validate_region_spec, defaults_from_case_config, RegionSpecError
 from size_field_builder import build_size_field
@@ -65,6 +66,56 @@ from visualize_standalone import write_standalone_viewer
 
 def _prompt(msg: str) -> str:
     return input(msg)
+
+
+def _resolve_feature_detection_kwargs(cfg: dict) -> tuple[dict, list[str]]:
+    """Read optional per-case feature-detection overrides out of
+    case_config, falling back to feature_extraction's documented defaults
+    -- returns (kwargs for compute_feature_summary, reasoning notes for
+    whichever values weren't explicitly overridden), same pattern as
+    region_spec.defaults_from_case_config."""
+    kwargs = {}
+    notes = []
+
+    if "gradient_percentile" in cfg:
+        kwargs["gradient_percentile"] = cfg["gradient_percentile"]
+    else:
+        notes.append(
+            f"gradient_percentile: no override in case_config, using default "
+            f"{feature_extraction.DEFAULT_GRADIENT_PERCENTILE} -- "
+            f"{feature_extraction.DEFAULT_GRADIENT_PERCENTILE_REASON}"
+        )
+
+    if "min_region_size" in cfg:
+        kwargs["min_region_size"] = cfg["min_region_size"]
+    elif "min_region_fraction" in cfg:
+        kwargs["min_region_fraction"] = cfg["min_region_fraction"]
+    else:
+        notes.append(
+            f"min_region_size: no override in case_config, using "
+            f"{feature_extraction.DEFAULT_MIN_REGION_FRACTION} of mesh vertex count (floor 3) "
+            f"-- {feature_extraction.DEFAULT_MIN_REGION_FRACTION_REASON}"
+        )
+
+    if "max_detection_passes" in cfg:
+        kwargs["max_passes"] = cfg["max_detection_passes"]
+    else:
+        notes.append(
+            f"max_detection_passes: no override in case_config, using default "
+            f"{feature_extraction.DEFAULT_MAX_DETECTION_PASSES} -- "
+            f"{feature_extraction.DEFAULT_MAX_DETECTION_PASSES_REASON}"
+        )
+
+    if "min_relative_threshold" in cfg:
+        kwargs["min_relative_threshold"] = cfg["min_relative_threshold"]
+    else:
+        notes.append(
+            f"min_relative_threshold: no override in case_config, using default "
+            f"{feature_extraction.DEFAULT_MIN_RELATIVE_THRESHOLD} -- "
+            f"{feature_extraction.DEFAULT_MIN_RELATIVE_THRESHOLD_REASON}"
+        )
+
+    return kwargs, notes
 
 
 def _load_or_author_region_spec(path: str, summary: dict, cfg: dict, args) -> dict:
@@ -93,7 +144,9 @@ def _load_or_author_region_spec(path: str, summary: dict, cfg: dict, args) -> di
         print(f"    wrote {path}")
         return spec
 
-    defaults = defaults_from_case_config(cfg)
+    defaults, notes = defaults_from_case_config(cfg)
+    for note in notes:
+        print(f"    {note}")
     print(f"\nNo region_spec.json yet at {path}.")
     print("Author one now: read the feature summary above, decide which candidate regions matter, "
           "and write a region for each (see region_spec.EXAMPLE_REGION_SPEC for the exact shape).")
@@ -120,14 +173,18 @@ def cmd_plan(args):
     print(f"    {len(mesh['points'])} vertices")
 
     print(f"==> extracting features on {cfg['driver_fields']}")
-    summary = compute_feature_summary(mesh, cfg["driver_fields"])
+    feature_kwargs, feature_notes = _resolve_feature_detection_kwargs(cfg)
+    for note in feature_notes:
+        print(f"    {note}")
+    summary = compute_feature_summary(mesh, cfg["driver_fields"], **feature_kwargs)
     summary_path = os.path.join(out_dir, "feature_summary.json")
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"    wrote {summary_path}")
     for field, s in summary["fields"].items():
-        print(f"    {field}: {len(s['candidate_regions'])} candidate region(s), "
-              f"gradient threshold {s['gradient_threshold_used']:.4g}")
+        thresholds = ", ".join(f"{t:.4g}" for t in s["gradient_thresholds_used"])
+        print(f"    {field}: {len(s['candidate_regions'])} candidate region(s) across "
+              f"{len(s['gradient_thresholds_used'])} detection pass(es) (thresholds: {thresholds})")
 
     region_spec_path = os.path.join(out_dir, "region_spec.json")
     spec = _load_or_author_region_spec(region_spec_path, summary, cfg, args)

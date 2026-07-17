@@ -123,42 +123,68 @@ def validate_region_spec(spec: dict) -> None:
             ts["direction_normal"] = None  # default: infer from shape at build time
 
 
-def defaults_from_case_config(case_config: dict, growth_rate: float = 2.5, background_size: float | None = None) -> dict:
-    """Build the region_spec `defaults` block from a case_config's hmin/hmax
-    (see case_config.py) — this is the hmin/hmax -> region_spec wiring: the
-    human supplies hmin/hmax once per case, and every region_spec authored
-    for that case starts from these same bounds.
+DEFAULT_GROWTH_RATE = 2.5
+DEFAULT_GROWTH_RATE_REASON = (
+    "standard default for this pipeline, not the more textbook-conservative ~1.2 this "
+    "used to default to. Measured once on this pipeline's own ramp2 case against a "
+    "real reference adapted mesh: at growth_rate=1.2-1.5 the background never gets a "
+    "real chance to relax back out to hmax across most of the domain (gradation "
+    "limiting's per-edge cap dominates over the raw coarsening target almost "
+    "everywhere), which is the 'way too many small elements in places we don't need "
+    "them' failure mode; 2.5-3.0 nearly doubled the fraction of the domain actually "
+    "reaching hmax with no measurable aspect-ratio cost (gradation limiting only "
+    "rescales a vertex's full matrix by one scalar, so it can't change anisotropy "
+    "ratio, only how far the background relaxes). That was only checked on one "
+    "case's geometry/mesh density, though -- override via case_config['growth_rate'] "
+    "if a case's own adapted mesh shows this isn't relaxing enough, or is scaling "
+    "too aggressively for its element quality."
+)
 
-    background_size defaults to hmax (i.e. "coarse everywhere except the
-    regions the LLM/human explicitly call out as needing refinement") unless
-    overridden — ask the human if a different background makes more sense
-    for a given case (e.g. a uniformly finer far-field for an unsteady case).
 
-    growth_rate defaults to 2.5, not the more textbook-conservative ~1.2 this
-    used to default to. Measured directly on this pipeline's own ramp2 case
-    against a real reference adapted mesh: at growth_rate=1.2-1.5 the
-    background never gets a real chance to relax back out to hmax across
-    most of the domain (gradation limiting's per-edge cap dominates over
-    the raw coarsening target almost everywhere except right at hmax's own
-    edge), which is exactly the "way too many small elements in places we
-    don't need them" failure mode. Pushing growth_rate up to ~2.5-3.0 nearly
-    doubled the fraction of the domain actually reaching hmax with no
-    measurable change to anisotropy/aspect ratio at the real features
-    (gradation limiting rescales a vertex's full matrix by one scalar, so it
-    cannot change aspect ratio -- only how far the background gets to
-    relax). Returns essentially plateaued past ~2.5-3.0, so this is picked as
-    a reasonably conservative point on that curve rather than the extreme
-    end -- still worth confirming/adjusting per case rather than assuming,
-    especially once real adapted meshes exist to check element quality
-    against.
+def defaults_from_case_config(case_config: dict) -> tuple[dict, list[str]]:
+    """Build the region_spec `defaults` block from a case_config.
+
+    hmin/hmax are required in case_config (see case_config.py) and always
+    used as-is -- this is the hmin/hmax -> region_spec wiring: the human
+    supplies hmin/hmax once per case, and every region_spec authored for
+    that case starts from these same bounds.
+
+    background_size and growth_rate are optional in case_config; if not
+    given, a documented default is used instead of silently picking a
+    number. Returns (defaults_dict, reasoning_notes) -- reasoning_notes is a
+    list of human-readable strings, one per value NOT explicitly given in
+    case_config, meant to be printed to whoever's running the pipeline (see
+    driver.py) so a default is never silently applied without the reason
+    being visible and overridable.
     """
     hmin, hmax = case_config["hmin"], case_config["hmax"]
-    return {
+    notes = []
+
+    if "background_size" in case_config:
+        background_size = case_config["background_size"]
+    else:
+        background_size = hmax
+        notes.append(
+            f"background_size: no override in case_config, using hmax ({hmax}) -- "
+            "coarse everywhere except regions the LLM/human explicitly call out. "
+            "Override via case_config['background_size'] if a case wants a uniformly "
+            "finer far-field (e.g. an unsteady case)."
+        )
+
+    if "growth_rate" in case_config:
+        growth_rate = case_config["growth_rate"]
+    else:
+        growth_rate = DEFAULT_GROWTH_RATE
+        notes.append(f"growth_rate: no override in case_config, using default {DEFAULT_GROWTH_RATE} "
+                     f"-- {DEFAULT_GROWTH_RATE_REASON}")
+
+    defaults = {
         "hmin": hmin,
         "hmax": hmax,
-        "background_size": background_size if background_size is not None else hmax,
+        "background_size": background_size,
         "growth_rate": growth_rate,
     }
+    return defaults, notes
 
 
 EXAMPLE_REGION_SPEC = {
@@ -200,3 +226,15 @@ EXAMPLE_REGION_SPEC = {
 if __name__ == "__main__":
     validate_region_spec(EXAMPLE_REGION_SPEC)
     print("EXAMPLE_REGION_SPEC is valid.")
+
+    cfg_no_overrides = {"hmin": 0.0005, "hmax": 0.03}
+    defaults, notes = defaults_from_case_config(cfg_no_overrides)
+    assert defaults == {"hmin": 0.0005, "hmax": 0.03, "background_size": 0.03, "growth_rate": DEFAULT_GROWTH_RATE}
+    assert len(notes) == 2, f"expected a reasoning note for both defaulted values, got {notes}"
+
+    cfg_with_overrides = {"hmin": 0.0005, "hmax": 0.03, "background_size": 0.01, "growth_rate": 1.5}
+    defaults2, notes2 = defaults_from_case_config(cfg_with_overrides)
+    assert defaults2 == {"hmin": 0.0005, "hmax": 0.03, "background_size": 0.01, "growth_rate": 1.5}
+    assert notes2 == [], f"expected no reasoning notes when both are overridden, got {notes2}"
+
+    print("defaults_from_case_config: reasoning notes only appear for non-overridden values, verified.")

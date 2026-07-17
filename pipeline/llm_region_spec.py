@@ -113,7 +113,9 @@ def draft_region_spec(feature_summary: dict, case_config: dict, human_notes: str
     """First-pass region_spec authoring straight from the feature summary
     (+ optional human notes), calling Claude directly via the Anthropic API."""
     client = _client()
-    defaults = defaults_from_case_config(case_config)
+    defaults, notes = defaults_from_case_config(case_config)
+    for note in notes:
+        print(f"    {note}")
 
     user_prompt = (
         f"case: {case_config['case_name']}\n"

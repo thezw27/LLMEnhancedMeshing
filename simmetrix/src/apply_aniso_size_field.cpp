@@ -190,6 +190,49 @@ void writeAdaptedMeshVTU(pMesh mesh, const string &path) {
          << " mesh region(s) with an unsupported topology while writing VTU" << endl;
   }
 
+  // No 3D regions at all means this is a surface-only (2D) mesh, not a
+  // volume mesh missing all its regions -- fall back to writing its faces
+  // as the cells. (Only done when regions are entirely absent: a real
+  // volume mesh's faces include interior faces shared between two
+  // regions, which would double up the geometry if written as cells too.)
+  if (types.empty()) {
+    int skippedFaces = 0;
+    FIter fiter = M_faceIter(mesh);
+    pFace face;
+    while ((face = FIter_next(fiter))) {
+      int vtkType = 0, numVerts = F_numEdges(face);
+      switch (numVerts) {
+      case 3: vtkType = 5; break;  // VTK_TRIANGLE
+      case 4: vtkType = 9; break;  // VTK_QUAD
+      default:
+        skippedFaces++;
+        continue;
+      }
+
+      pPList faceVerts = F_vertices(face, 1);
+      if (PList_size(faceVerts) != numVerts) {
+        PList_delete(faceVerts);
+        skippedFaces++;
+        continue;
+      }
+      for (int i = 0; i < numVerts; i++) {
+        pVertex v = static_cast<pVertex>(PList_item(faceVerts, i));
+        connectivity.push_back(vertexIndex.at(v));
+      }
+      PList_delete(faceVerts);
+
+      runningOffset += numVerts;
+      offsets.push_back(runningOffset);
+      types.push_back(vtkType);
+    }
+    FIter_delete(fiter);
+
+    if (skippedFaces > 0) {
+      cerr << "Warning: skipped " << skippedFaces
+           << " mesh face(s) with an unsupported topology while writing VTU" << endl;
+    }
+  }
+
   ofstream out(path);
   if (!out) throw std::runtime_error("could not open VTU output file: " + path);
   out << "<?xml version=\"1.0\"?>\n"

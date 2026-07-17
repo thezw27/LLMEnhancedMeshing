@@ -123,6 +123,28 @@ def validate_region_spec(spec: dict) -> None:
             ts["direction_normal"] = None  # default: infer from shape at build time
 
 
+def defaults_from_case_config(case_config: dict, growth_rate: float = 1.2, background_size: float | None = None) -> dict:
+    """Build the region_spec `defaults` block from a case_config's hmin/hmax
+    (see case_config.py) — this is the hmin/hmax -> region_spec wiring: the
+    human supplies hmin/hmax once per case, and every region_spec authored
+    for that case starts from these same bounds.
+
+    background_size defaults to hmax (i.e. "coarse everywhere except the
+    regions the LLM/human explicitly call out as needing refinement") unless
+    overridden — ask the human if a different background makes more sense
+    for a given case (e.g. a uniformly finer far-field for an unsteady case).
+    growth_rate defaults to 1.2 (a common mesh-adaptation gradation rate);
+    also worth confirming with the human per case rather than assuming.
+    """
+    hmin, hmax = case_config["hmin"], case_config["hmax"]
+    return {
+        "hmin": hmin,
+        "hmax": hmax,
+        "background_size": background_size if background_size is not None else hmax,
+        "growth_rate": growth_rate,
+    }
+
+
 EXAMPLE_REGION_SPEC = {
     "defaults": {
         "hmin": 0.0005,

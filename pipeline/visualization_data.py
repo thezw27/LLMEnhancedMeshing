@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from vtu_io import vertex_adjacency
+
 
 def _extract_tetra_boundary_faces(tetra_conn: np.ndarray) -> np.ndarray:
     """Faces that belong to exactly one tet are boundary faces."""
@@ -85,6 +87,42 @@ def build_whole_geometry_payload(mesh: dict, size_field_result: dict, glyph_targ
     }
 
 
+def local_edge_length_scalar(mesh: dict) -> np.ndarray:
+    """Per-vertex average incident edge length -- a simple proxy for "local
+    mesh size" that doesn't require a target size_field_result. Used for
+    reviewing a mesh you only have the *actual* geometry for (e.g. the
+    adapted mesh handed back from SCOREC), as opposed to visualizing a
+    *requested* size field you built yourself."""
+    points = mesh["points"]
+    adjacency = vertex_adjacency(mesh)
+    n = len(points)
+    out = np.zeros(n)
+    for i in range(n):
+        nbrs = adjacency[i]
+        if not nbrs:
+            continue
+        d = np.linalg.norm(points[list(nbrs)] - points[i], axis=1)
+        out[i] = d.mean()
+    # fall back to the global mean for any isolated vertex (avoids a 0 that
+    # would otherwise wreck the color scale)
+    nonzero = out[out > 0]
+    fallback = nonzero.mean() if len(nonzero) else 1.0
+    out[out == 0] = fallback
+    return out
+
+
+def build_adapted_mesh_payload(mesh: dict, glyph_target_count: int = 70) -> dict:
+    """Like build_whole_geometry_payload, but for a mesh you don't have a
+    target size_field_result for (e.g. the adapted mesh handed back from
+    SCOREC for a human-review pass) -- colors/glyphs by *actual* local edge
+    length instead of a *requested* size, by wrapping it in the same [3,3]
+    isotropic-matrix shape the rest of the visualization pipeline expects."""
+    edge_len = local_edge_length_scalar(mesh)
+    matrices = np.stack([np.eye(3) * max(float(h), 1e-9) for h in edge_len])
+    fake_result = {"matrices": matrices}
+    return build_whole_geometry_payload(mesh, fake_result, glyph_target_count=glyph_target_count)
+
+
 def payload_to_json_dict(payload: dict, round_ndigits: int = 4) -> dict:
     """Round + convert numpy arrays to plain lists for embedding in an HTML/JS
     widget (keeps the payload compact)."""
@@ -120,8 +158,6 @@ if __name__ == "__main__":
     print("two-tet shared-face boundary extraction OK:", faces2.shape)
 
     # magnitude field sanity check on a trivial isotropic size field
-    class _Dummy:
-        pass
     n = 5
     matrices = np.stack([np.eye(3) * h for h in [0.01, 0.02, 0.03, 0.04, 0.05]])
     mesh3 = {"points": np.zeros((n, 3)), "cells": [], "point_data": {}, "cell_data": {}}
@@ -129,3 +165,12 @@ if __name__ == "__main__":
     expected = np.array([0.01, 0.02, 0.03, 0.04, 0.05])
     assert np.allclose(payload["magnitude"], expected), payload["magnitude"]
     print("magnitude field OK (isotropic case reduces to the diagonal size):", payload["magnitude"].tolist())
+
+    # adapted-mesh payload self-test: a small triangle strip, edge length ~ known
+    pts4 = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]], dtype=float)
+    tris4 = np.array([[0, 1, 2], [1, 3, 2]])
+    mesh4 = {"points": pts4, "cells": [("triangle", tris4)], "point_data": {}, "cell_data": {}}
+    adapted_payload = build_adapted_mesh_payload(mesh4)
+    assert adapted_payload["matrices"].shape == (4, 3, 3)
+    assert np.all(adapted_payload["magnitude"] > 0)
+    print("build_adapted_mesh_payload OK, magnitudes:", adapted_payload["magnitude"].tolist())

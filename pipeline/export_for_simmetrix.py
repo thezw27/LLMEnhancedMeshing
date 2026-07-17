@@ -1,32 +1,36 @@
 """
 export_for_simmetrix.py — serialize the final per-vertex anisoSize matrices
-into a small, dependency-free transfer format for the SCOREC remote machine
-(where the Simmetrix library actually lives — nothing in this repo links
-against Simmetrix directly).
+into the exact transfer format the real SCOREC-side program expects.
 
-Two things are written, both keyed by the *same* 0-based vertex index used
-in vtu_io's mesh dict (i.e. row order in mesh["points"]):
+The remote program now exists: simmetrix/src/apply_aniso_size_field.cpp
+(usage: apply_aniso_size_field <model.smd> <mesh.sms> <size_field.txt>
+<output_dir>). Reading it settled the open question this file used to flag:
+vertex correspondence is coordinate-based, always — it builds a KD-tree
+(nanoflann) over the existing Simmetrix mesh's vertices and maps every line
+of size_field.txt to its nearest-coordinate vertex, then calls
+MSA_setAnisoVertexSize. So our export only needs (x, y, z, matrix); no
+vertex index/ID is read or needed on the C++ side.
 
-  1. <name>.csv   — human-readable: vertex_id,x,y,z,m00,m01,m02,m10,m11,m12,m20,m21,m22
-  2. <name>.npz   — same data, compact, for round-tripping back into this
-                    pipeline (e.g. to re-visualize exactly what was sent)
+IMPORTANT FORMAT NOTE: the C++ reader (readSizeFieldFile) parses each line
+as exactly 12 whitespace/comma-separated numbers — "X Y Z m00 m01 m02 m10
+m11 m12 m20 m21 m22" — with no header and no leading id column. An earlier
+version of this file wrote a 13-column CSV with a "vertex_id" first column;
+that shifts every field over by one and silently corrupts the data (the
+reader doesn't crash on a header line since it fails a numeric parse and
+warns/skips it, but on the *data* rows the vertex_id parses as a valid
+double and every subsequent field lands in the wrong slot). write_size_field
+below now writes the correct plain-text format as the primary output.
 
-OPEN QUESTION for the remote side (flagged, not solved here): Simmetrix
-mesh vertices are identified by its own internal handles/IDs, not by our
-"row index into points". Whatever we send needs a correspondence rule back
-to real MSA vertex objects. The two usual options:
-  (a) index correspondence — valid only if the VTU we read is literally the
-      same mesh (same vertex ordering) that Simmetrix will adapt, i.e. this
-      is the *first* adaptation pass on the solver's native mesh.
-  (b) coordinate matching — look up each Simmetrix vertex by nearest
-      coordinate (needed once the mesh has already been adapted at least
-      once, since new/adapted meshes renumber vertices).
-This file always ships (x,y,z) alongside the index specifically so either
-strategy works on the remote side without re-exporting.
+Three things are written:
 
-remote_apply_size_field_stub.c below is a placeholder for the actual
-MSA_setAnisoVertexSize() loop — intentionally left unfinished pending your
-directions on SCOREC connectivity/build setup.
+  1. <name>.txt   — the actual file the remote program reads: one line per
+                    vertex, "x y z m00 m01 m02 m10 m11 m12 m20 m21 m22",
+                    space-separated, no header.
+  2. <name>.csv   — human-readable reference copy (with header + a row
+                    index) for inspecting what was sent; NOT the file that
+                    gets shipped to SCOREC.
+  3. <name>.npz   — compact round-trip format for re-loading back into this
+                    pipeline (e.g. to re-visualize exactly what was sent).
 """
 
 from __future__ import annotations
@@ -40,11 +44,16 @@ def write_size_field(path_prefix: str, mesh: dict, size_field_result: dict) -> N
     n = len(points)
     assert matrices.shape == (n, 3, 3)
 
-    # .npz — compact round-trip format
-    np.savez(f"{path_prefix}.npz", points=points, matrices=matrices,
-             iso_equivalent_size=size_field_result["iso_equivalent_size"])
+    # .txt — the file that actually gets SCP'd to SCOREC and read by
+    # apply_aniso_size_field.cpp. Exactly 12 fields per line, no header.
+    with open(f"{path_prefix}.txt", "w") as f:
+        for i in range(n):
+            x, y, z = points[i]
+            m = matrices[i].flatten()
+            f.write(f"{x:.9g} {y:.9g} {z:.9g} " + " ".join(f"{v:.9g}" for v in m) + "\n")
 
-    # .csv — human-readable / easy for a remote script in any language to parse
+    # .csv — human-readable reference only (extra columns the remote reader
+    # does NOT expect — do not send this file to apply_aniso_size_field).
     with open(f"{path_prefix}.csv", "w") as f:
         f.write("vertex_id,x,y,z,m00,m01,m02,m10,m11,m12,m20,m21,m22\n")
         for i in range(n):
@@ -52,11 +61,32 @@ def write_size_field(path_prefix: str, mesh: dict, size_field_result: dict) -> N
             m = matrices[i].flatten()
             f.write(f"{i},{x:.9g},{y:.9g},{z:.9g}," + ",".join(f"{v:.9g}" for v in m) + "\n")
 
-    print(f"wrote {path_prefix}.npz and {path_prefix}.csv ({n} vertices)")
+    # .npz — compact round-trip format
+    np.savez(f"{path_prefix}.npz", points=points, matrices=matrices,
+             iso_equivalent_size=size_field_result["iso_equivalent_size"])
+
+    print(f"wrote {path_prefix}.txt (send this to SCOREC), {path_prefix}.csv (reference), "
+          f"{path_prefix}.npz ({n} vertices)")
+
+
+def read_size_field_txt(path: str):
+    """Round-trip reader for the .txt format (mirrors what the C++ side parses)."""
+    pts, mats = [], []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            vals = [float(v) for v in line.replace(",", " ").split()]
+            if len(vals) != 12:
+                continue
+            pts.append(vals[0:3])
+            mats.append(np.array(vals[3:12]).reshape(3, 3))
+    return np.array(pts), np.array(mats)
 
 
 def read_size_field_csv(path: str):
-    """Round-trip reader, e.g. for re-visualizing exactly what was exported."""
+    """Round-trip reader for the human-readable .csv reference copy."""
     ids, pts, mats = [], [], []
     with open(path) as f:
         next(f)  # header
@@ -68,44 +98,22 @@ def read_size_field_csv(path: str):
     return np.array(ids), np.array(pts), np.array(mats)
 
 
-REMOTE_STUB = '''\
-/* remote_apply_size_field_stub.c
- *
- * STUB — not runnable yet. Placeholder for the SCOREC-side program that
- * reads the .csv this pipeline exports and calls MSA_setAnisoVertexSize()
- * for every vertex, then drives Simmetrix's adaptation.
- *
- * TODO (pending your direction on SCOREC access / build setup):
- *   - confirm the exact Simmetrix headers/link libraries for this call
- *   - decide vertex correspondence strategy: row-index match (first pass
- *     on the solver's native mesh) vs. nearest-coordinate lookup (after
- *     at least one prior adaptation has renumbered vertices)
- *   - confirm how the adapted mesh gets written back out / SCP'd home
- *
- * Sketch of the loop once the above is settled:
- *
- *   FILE *f = fopen("size_field.csv", "r");
- *   char line[512];
- *   fgets(line, sizeof(line), f); // skip header
- *   while (fgets(line, sizeof(line), f)) {
- *       int vid; double x,y,z, m[9];
- *       sscanf(line, "%d,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf",
- *              &vid, &x,&y,&z, &m[0],&m[1],&m[2],&m[3],&m[4],&m[5],&m[6],&m[7],&m[8]);
- *
- *       pVertex v = lookup_vertex(vid, x, y, z);   // <-- correspondence strategy goes here
- *       double anisoSize[3][3] = {
- *           {m[0], m[1], m[2]},
- *           {m[3], m[4], m[5]},
- *           {m[6], m[7], m[8]},
- *       };
- *       MSA_setAnisoVertexSize(v, anisoSize);      // real Simmetrix call
- *   }
- *
- *   // then: run the adapter, write out the adapted mesh, done on SCOREC side
- */
-'''
-
 if __name__ == "__main__":
-    with open("remote_apply_size_field_stub.c", "w") as f:
-        f.write(REMOTE_STUB)
-    print("wrote remote_apply_size_field_stub.c (placeholder, not runnable)")
+    # quick self-test: round-trip the .txt format and confirm it matches
+    # what write_size_field produced, with the exact column layout
+    # apply_aniso_size_field.cpp's readSizeFieldFile expects.
+    import numpy as _np
+
+    rng = _np.random.default_rng(0)
+    pts = rng.uniform(-1, 1, size=(20, 3))
+    mats = _np.stack([_np.eye(3) * h for h in rng.uniform(0.001, 0.02, size=20)])
+    mesh = {"points": pts}
+    result = {"matrices": mats, "iso_equivalent_size": _np.linalg.norm(mats, axis=2).min(axis=1)}
+
+    write_size_field("/tmp/_export_selftest", mesh, result)
+    pts2, mats2 = read_size_field_txt("/tmp/_export_selftest.txt")
+    assert _np.allclose(pts2, pts) and _np.allclose(mats2, mats), "round-trip mismatch"
+    with open("/tmp/_export_selftest.txt") as f:
+        first_line_fields = f.readline().split()
+    assert len(first_line_fields) == 12, f"expected 12 fields per line, got {len(first_line_fields)}"
+    print("self-test OK: .txt format is exactly 12 space-separated fields per line, round-trips cleanly")

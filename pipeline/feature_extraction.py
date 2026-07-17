@@ -35,24 +35,78 @@ def compute_vertex_gradient(points: np.ndarray, adjacency: list[set], field: np.
     This is the standard cheap alternative to a full Hessian recovery pass —
     good enough to *locate and orient* features, not intended to feed a
     curvature-accurate sizing formula.
+
+    Performance note: this solves the 3-unknown least-squares system via the
+    normal equations (A^T A) g = A^T b (a direct 3x3 solve) instead of
+    np.linalg.lstsq's general SVD-based path -- lstsq was the single biggest
+    line-level cost in feature detection on profiling (a few thousand tiny
+    SVDs adds up). A^T A can be singular for a genuinely degenerate
+    neighborhood (fewer than 3 neighbors, or all of them collinear); a small
+    ridge term keeps the solve well-posed in that case instead of raising,
+    at the cost of a slightly damped-toward-zero gradient there rather than
+    lstsq's minimum-norm answer -- an acceptable trade for a "cheap,
+    locate-and-orient-only" estimate per the module's own docstring above.
     """
     n = len(points)
     grad = np.zeros((n, 3))
+    neighbor_arrays = [np.fromiter(adjacency[i], dtype=np.int64, count=len(adjacency[i]))
+                       for i in range(n)]
+    eye3 = np.eye(3)
     for i in range(n):
-        neighbors = adjacency[i]
-        if not neighbors:
+        nbrs = neighbor_arrays[i]
+        if len(nbrs) == 0:
             continue
-        dx = points[list(neighbors)] - points[i]
-        df = field[list(neighbors)] - field[i]
+        dx = points[nbrs] - points[i]
+        df = field[nbrs] - field[i]
         dist = np.linalg.norm(dx, axis=1)
         dist[dist < 1e-12] = 1e-12
         w = 1.0 / dist
         A = dx * w[:, None]
         b = df * w
-        # solve least squares A g = b  (3 unknowns)
-        g, *_ = np.linalg.lstsq(A, b, rcond=None)
-        grad[i] = g
+        AtA = A.T @ A
+        Atb = A.T @ b
+        grad[i] = np.linalg.solve(AtA + 1e-12 * eye3, Atb)
     return grad
+
+
+def compute_vertex_gradients_multi(points: np.ndarray, adjacency: list[set],
+                                    fields: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Same per-vertex weighted-least-squares gradient as
+    compute_vertex_gradient, but for several fields at once, sharing the
+    geometry-only work (neighbor lookup, displacement vectors, distance
+    weights, and A^T A) across all of them instead of recomputing it once
+    per field. Only A^T b and the final solve actually depend on which
+    field's values are being differenced.
+
+    Worth it specifically because this pipeline always runs feature
+    detection over several driver fields together (e.g. mach_number,
+    pressure, temperature) -- profiling showed the per-field geometry setup
+    was the majority of compute_vertex_gradient's cost, so with N fields
+    this cuts that part from N x to 1x.
+    """
+    n = len(points)
+    field_names = list(fields.keys())
+    grads = {name: np.zeros((n, 3)) for name in field_names}
+    eye3 = np.eye(3)
+
+    for i in range(n):
+        nbrs = np.fromiter(adjacency[i], dtype=np.int64, count=len(adjacency[i]))
+        if len(nbrs) == 0:
+            continue
+        dx = points[nbrs] - points[i]
+        dist = np.linalg.norm(dx, axis=1)
+        dist[dist < 1e-12] = 1e-12
+        w = 1.0 / dist
+        A = dx * w[:, None]
+        AtA = A.T @ A
+        AtA_reg = AtA + 1e-12 * eye3
+        for name in field_names:
+            field = fields[name]
+            df = field[nbrs] - field[i]
+            b = df * w
+            Atb = A.T @ b
+            grads[name][i] = np.linalg.solve(AtA_reg, Atb)
+    return grads
 
 
 def _connected_components_on_mask(adjacency: list[set], mask: np.ndarray) -> np.ndarray:

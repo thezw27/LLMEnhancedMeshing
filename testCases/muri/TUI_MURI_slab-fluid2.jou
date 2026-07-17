@@ -1,0 +1,124 @@
+/file/set-tui-version "25.2"
+
+; ZONE MERGES -- muriInit.cas comes out of the meshing pipeline mesh-only:
+; all 12 boundary face zones (ids 3-14, confirmed directly in muriInit.cas)
+; generically bc-type 3 = wall, no name/BC assignment yet -- same situation
+; documented in testCases/ramp/setup_ramp.jou for that case's .cas.
+;
+; ASSUMPTION FLAGGED: Fluent's /mesh/modify-zones/merge-zones keeps the
+; FIRST-listed zone id as the surviving merged zone (the rest are absorbed
+; into it) -- inferred from testCases/ramp2/TUI_MURI_slab-fluid2.jou's own
+; `merge-zones 4 5 6` being followed later by BC calls against zone "4" (the
+; first-listed id) and never zone 5 or 6 again. Not independently verified
+; against a live Fluent session for this specific muri mesh -- if a run
+; shows the surviving id is actually the LAST-listed or lowest-numbered zone
+; instead, swap the zone id used in the zone-type/zone-name calls below to
+; match (8->became-wedge, 6->became-outlet).
+/mesh/modify-zones/merge-zones 8 9 10 11 7
+
+/mesh/modify-zones/merge-zones 6 3
+
+; BC VALUES -- same flow conditions as the ramp/ramp2 cases (freestream
+; conditions unchanged for this run):
+;   P0 = 5.1091970901089320e+06 Pa, T0 = 1.2787752593014334e+03 K, M = 4.9510068149271147, gamma = 1.4, R = 287.05 J/(kg K)
+; Isentropic relations (flow in +X, inlet normal-to-boundary):
+;   factor    = 1 + (gamma-1)/2 * M^2                    = 5.902493696290946
+;   T_static  = T0 / factor                               = 216.65 K            (-> TEMP_VALUE)
+;   p_static  = P0 / factor^(gamma/(gamma-1))              = 10226.529945057235 Pa (-> PRESSURE_VALUE, both occurrences)
+;   a_static  = sqrt(gamma * R * T_static)                 = 295.06801842964956 m/s
+;   V         = M * a_static                               = 1460.8837701122345 m/s (-> VELOCITY_VALUE)
+; T0_VALUE (outlet backflow total temperature) = T0 given above = 1278.7752593014334 K
+; T_static landing exactly on the US Standard Atmosphere's 216.65 K stratosphere value is a good sanity check.
+
+; PHYSICS
+/define/models/solver/density-based-implicit yes
+
+/define/operating-conditions/operating-pressure 0
+
+/define/models/energy yes
+
+/define/models/viscous/inviscid yes
+
+/define/materials/change-create air air yes ideal-gas no no no no
+
+/define/boundary-conditions/fluid region_1 yes air no no no no 0 no 0 no 0 no 0 no 0 no 0 no no no no
+
+; -------- zones 5, 4: SYMMETRY --------
+; Given as two separate symmetry zones (not merged, matching how ramp/ramp2
+; keep their two symmetry faces distinct as "front"/"back"). No physical
+; front/back orientation was given for this new muri geometry, so these are
+; named generically by zone id rather than guessing which is which -- rename
+; to something more descriptive once the actual geometry orientation is
+; confirmed, the same way front/back were assigned for the ramp cases.
+/define/boundary-conditions/zone-type 5 symmetry
+
+/define/boundary-conditions/zone-name 5 symmetry_5
+
+/define/boundary-conditions/zone-type 4 symmetry
+
+/define/boundary-conditions/zone-name 4 symmetry_4
+
+; -------- zone 13: INLET --------
+/define/boundary-conditions/zone-type 13 velocity-inlet
+
+/define/boundary-conditions/zone-name 13 inlet
+
+/define/boundary-conditions/zone-type interior-region_1 interior
+
+; -------- zones 6+3 merged: OUTLET (surviving id 6, see merge note above) --------
+/define/boundary-conditions/zone-type 6 pressure-outlet
+
+/define/boundary-conditions/zone-name 6 outlet
+
+; -------- zones 8+9+10+11+7 merged: WEDGE, wall BC (surviving id 8, see merge note above) --------
+/define/boundary-conditions/zone-type 8 wall
+
+/define/boundary-conditions/zone-name 8 wedge
+
+; -------- zone 12: TOP, wall BC --------
+/define/boundary-conditions/zone-type 12 wall
+
+/define/boundary-conditions/zone-name 12 top
+
+; -------- zone 14: BOTTOM, wall BC --------
+/define/boundary-conditions/zone-type 14 wall
+
+/define/boundary-conditions/zone-name 14 bottom
+
+/define/boundary-conditions/velocity-inlet inlet no no yes yes no 1460.8837701122345 no 10226.529945057235 no 216.65 no 10226.529945057235
+
+/define/boundary-conditions/pressure-outlet outlet yes no 10226.529945057235 no 1278.7752593014334 no yes yes yes no no no
+
+/solve/set/flux-type 1
+
+/solve/set/convergence-acceleration-for-stretched-meshes yes
+
+/file/set-idle-timeout yes 1 no
+
+/solve/initialize/hyb-initialization
+/solve/initialize/fmg-initialization yes
+
+/solve/set/high-speed-numerics/enable yes
+
+;/solve/set/courant-number 0.3
+
+; residual convergence: 0.0001 on every monitored residual except X-velocity,
+; relaxed to 10000000 (effectively disabled) per this case's request. Slot
+; order [continuity, x-velocity, y-velocity, z-velocity, energy] -- same
+; ordering used in the ramp/ramp2 journals this was derived from, just with
+; the relaxed slot moved from position 3 (y-velocity) to position 2
+; (x-velocity).
+/solve/monitors/residual/convergence-criteria 0.0001 10000000 0.0001 0.0001 0.0001
+/solve/iterate 5000
+
+;ENSIGHT MANUAL -- exports adapted_muri_fields.encas (+ .geo and per-quantity
+; result files) into Fluent's current working directory at run time. Field
+; list and trailing tokens (". yes (*) () no") are unchanged from the
+; verified pattern used in both the ramp and ramp2 journals (and the
+; repo-root example.jou): "yes (*) ()" selects all zones/surfaces for
+; export, and the final "no" is one more Q&A answer whose exact prompt
+; hasn't been confirmed by a completed local run against THIS mesh yet --
+; carried over from ramp2's journal on the same basis noted there.
+/file/export/ensight-gold encasFiles/outAd1.encas pressure mach-number velocity-magnitude sound-speed temperature density dynamic-pressure enthalpy gamma gas-constant . yes (*) () no
+
+exit yes

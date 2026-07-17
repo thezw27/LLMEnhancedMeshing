@@ -1,15 +1,17 @@
 """
 export_for_simmetrix.py — serialize the final per-vertex anisoSize matrices
-into the exact transfer format the real SCOREC-side program expects.
+into the exact transfer format apply_aniso_size_field.cpp expects.
 
-The remote program now exists: simmetrix/src/apply_aniso_size_field.cpp
-(usage: apply_aniso_size_field <model.smd> <mesh.sms> <size_field.txt>
-<output_dir>). Reading it settled the open question this file used to flag:
-vertex correspondence is coordinate-based, always — it builds a KD-tree
-(nanoflann) over the existing Simmetrix mesh's vertices and maps every line
-of size_field.txt to its nearest-coordinate vertex, then calls
-MSA_setAnisoVertexSize. So our export only needs (x, y, z, matrix); no
-vertex index/ID is read or needed on the C++ side.
+That program exists at simmetrix/src/apply_aniso_size_field.cpp (usage:
+apply_aniso_size_field <native_model> <model.smd> <mesh.sms>
+<size_field.txt> <output_dir>), and run_adaptation.py runs it directly as
+a subprocess (this pipeline and the Simmetrix side run on the same
+machine — no scp/staging step). Vertex correspondence is coordinate-based,
+always — it builds a KD-tree (nanoflann) over the existing Simmetrix
+mesh's vertices and maps every line of size_field.txt to its
+nearest-coordinate vertex, then calls MSA_setAnisoVertexSize. So our
+export only needs (x, y, z, matrix); no vertex index/ID is read or needed
+on the C++ side.
 
 IMPORTANT FORMAT NOTE: the C++ reader (readSizeFieldFile) parses each line
 as exactly 12 whitespace/comma-separated numbers — "X Y Z m00 m01 m02 m10
@@ -23,12 +25,12 @@ below now writes the correct plain-text format as the primary output.
 
 Three things are written:
 
-  1. <name>.txt   — the actual file the remote program reads: one line per
-                    vertex, "x y z m00 m01 m02 m10 m11 m12 m20 m21 m22",
+  1. <name>.txt   — the actual file apply_aniso_size_field reads: one line
+                    per vertex, "x y z m00 m01 m02 m10 m11 m12 m20 m21 m22",
                     space-separated, no header.
   2. <name>.csv   — human-readable reference copy (with header + a row
-                    index) for inspecting what was sent; NOT the file that
-                    gets shipped to SCOREC.
+                    index) for inspecting what was sent; NOT the file
+                    apply_aniso_size_field reads.
   3. <name>.npz   — compact round-trip format for re-loading back into this
                     pipeline (e.g. to re-visualize exactly what was sent).
 """
@@ -44,16 +46,16 @@ def write_size_field(path_prefix: str, mesh: dict, size_field_result: dict) -> N
     n = len(points)
     assert matrices.shape == (n, 3, 3)
 
-    # .txt — the file that actually gets SCP'd to SCOREC and read by
-    # apply_aniso_size_field.cpp. Exactly 12 fields per line, no header.
+    # .txt — the file apply_aniso_size_field.cpp actually reads. Exactly 12
+    # fields per line, no header.
     with open(f"{path_prefix}.txt", "w") as f:
         for i in range(n):
             x, y, z = points[i]
             m = matrices[i].flatten()
             f.write(f"{x:.9g} {y:.9g} {z:.9g} " + " ".join(f"{v:.9g}" for v in m) + "\n")
 
-    # .csv — human-readable reference only (extra columns the remote reader
-    # does NOT expect — do not send this file to apply_aniso_size_field).
+    # .csv — human-readable reference only (extra columns apply_aniso_size_field
+    # does NOT expect — don't pass this file to it).
     with open(f"{path_prefix}.csv", "w") as f:
         f.write("vertex_id,x,y,z,m00,m01,m02,m10,m11,m12,m20,m21,m22\n")
         for i in range(n):
@@ -65,7 +67,7 @@ def write_size_field(path_prefix: str, mesh: dict, size_field_result: dict) -> N
     np.savez(f"{path_prefix}.npz", points=points, matrices=matrices,
              iso_equivalent_size=size_field_result["iso_equivalent_size"])
 
-    print(f"wrote {path_prefix}.txt (send this to SCOREC), {path_prefix}.csv (reference), "
+    print(f"wrote {path_prefix}.txt (fed to apply_aniso_size_field), {path_prefix}.csv (reference), "
           f"{path_prefix}.npz ({n} vertices)")
 
 

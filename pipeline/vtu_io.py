@@ -30,8 +30,11 @@ try:
     import meshio
 except ImportError as e:  # pragma: no cover
     raise ImportError(
-        "meshio is required (pip install meshio). It's a thin, dependency-light "
-        "reader/writer for VTU/VTP/etc — no full VTK build needed."
+        "meshio is required. Run `bash pipeline/setup_env.sh` once, then "
+        "`conda activate llmesh` before running anything in this directory "
+        "(the system Python here has no working pip and lacks meshio/scipy/numpy). "
+        "meshio itself is a thin, dependency-light reader/writer for VTU/VTP/etc "
+        "— no full VTK build needed."
     ) from e
 
 

@@ -1,21 +1,26 @@
 """
 driver.py -- end-to-end CLI orchestrator for the LLM-enhanced anisotropic
-adaptation pipeline. Ties together every stage that used to be a separate
-hand-run snippet (see PIPELINE.md's stage list):
+adaptation pipeline. Runs entirely on one machine (this one) -- there is
+no separate "local sandbox" that hands a run script to a human to execute
+elsewhere; run_adaptation.py invokes the Simmetrix side directly. Ties
+together every stage that used to be a separate hand-run snippet:
 
   read_vtu -> feature_extraction -> region_spec authoring (LLM or human) ->
   size_field_builder -> standalone 3D visualization -> human approve/revise
-  loop -> export_for_simmetrix -> generate_scorec_run_script
+  loop -> export_for_simmetrix -> run_adaptation (adapt + Fluent .cas export)
 
-...and a second command, `review`, for the loop-back stage after SCOREC
-hands a case back: visualize the adapted VTU, get an approve/reject on the
-mesh itself, and point at the adapted Fluent .cas once approved.
+...and a second command, `review`, for looking at what came out of
+adaptation: visualize the adapted VTU, get an approve/reject on the mesh
+itself, and point at the adapted Fluent .cas once approved.
 
 No Cowork dependency: this is plain Python (argparse + the pipeline
 modules: vtu_io, feature_extraction, region_spec, size_field_builder,
-export_for_simmetrix, case_config, generate_scorec_run_script,
-visualization_data, visualize_standalone), runs from any terminal with
-`pip install meshio scipy numpy`.
+export_for_simmetrix, case_config, run_adaptation, visualization_data,
+visualize_standalone), runs from any terminal.
+
+The system Python here has no working pip and lacks meshio/scipy/numpy,
+so this needs its own conda env: `bash setup_env.sh` once, then
+`conda activate llmesh` before running this (see environment.yml).
 
 region_spec authoring can go two ways:
   --auto-llm    call Claude directly via the Anthropic API (llm_region_spec.py)
@@ -34,10 +39,10 @@ Usage:
 Verified end-to-end against the synthetic double-ramp test case in
 pipeline/tests/ (double_ramp.vtu): `plan` correctly pauses the first time
 with no region_spec.json (prints the feature summary + defaults + where to
-write it), completes the whole build->visualize->export->generate-script
-flow once one exists, and `review` correctly visualizes an adapted VTU and
-reports the paired .cas path on approval (or tells you to go back and
-revise on rejection).
+write it), completes the whole build->visualize->export->adapt flow once
+one exists, and `review` correctly visualizes an adapted VTU and reports
+the paired .cas path on approval (or tells you to go back and revise on
+rejection).
 """
 
 from __future__ import annotations
@@ -47,13 +52,13 @@ import json
 import os
 import sys
 
-from case_config import load_case_config, scorec_output_names, CaseConfigError
+from case_config import load_case_config, CaseConfigError, ADAPTED_VTU_NAME, ADAPTED_CAS_NAME
 from vtu_io import read_vtu
 from feature_extraction import compute_feature_summary
 from region_spec import validate_region_spec, defaults_from_case_config, RegionSpecError
 from size_field_builder import build_size_field
 from export_for_simmetrix import write_size_field
-from generate_scorec_run_script import generate_run_script
+from run_adaptation import run_adaptation, AdaptationError
 from visualization_data import build_whole_geometry_payload, build_adapted_mesh_payload, payload_to_json_dict
 from visualize_standalone import write_standalone_viewer
 
@@ -177,14 +182,19 @@ def cmd_plan(args):
     size_field_prefix = os.path.join(out_dir, "size_field")
     write_size_field(size_field_prefix, mesh, result)
 
-    results_dir = os.path.join(out_dir, "results")
-    run_script_path = os.path.join(out_dir, f"run_case_on_scorec_{cfg['case_name']}.sh")
-    generate_run_script(cfg, f"{size_field_prefix}.txt", results_dir, run_script_path)
+    print("\n==> running adaptation (apply_aniso_size_field + Fluent .cas export)...")
+    try:
+        adapt_result = run_adaptation(cfg, f"{size_field_prefix}.txt")
+    except AdaptationError as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
+    print(f"    adapted VTU: {adapt_result['adapted_vtu']}")
+    print(f"    adapted Fluent case: {adapt_result['adapted_cas']}")
+    print(f"    raw Simmetrix mesh: {adapt_result['adapted_sms']}")
 
     print("\n==> plan complete.")
-    print(f"    1. run this on a machine with SCOREC access: bash {run_script_path}")
-    print(f"    2. then:  python driver.py review --case-config {args.case_config} "
-          f"--adapted-dir {results_dir}")
+    print(f"    next: python driver.py review --case-config {args.case_config} "
+          f"--adapted-dir {adapt_result['output_dir']}")
 
 
 def cmd_review(args):
@@ -194,14 +204,12 @@ def cmd_review(args):
         print(f"ERROR: invalid case_config: {e}")
         sys.exit(1)
 
-    vtu_name, cas_name = scorec_output_names(cfg)
-    adapted_vtu_path = os.path.join(args.adapted_dir, vtu_name)
-    adapted_cas_path = os.path.join(args.adapted_dir, cas_name)
+    adapted_vtu_path = os.path.join(args.adapted_dir, ADAPTED_VTU_NAME)
+    adapted_cas_path = os.path.join(args.adapted_dir, ADAPTED_CAS_NAME)
 
     if not os.path.exists(adapted_vtu_path):
-        print(f"ERROR: expected adapted VTU at {adapted_vtu_path} -- did the SCOREC run script "
-              f"finish, and does it actually produce a VTU with that name? "
-              f"(override via case_config.scorec.adapted_vtu_name)")
+        print(f"ERROR: expected adapted VTU at {adapted_vtu_path} -- did `driver.py plan` "
+              f"finish successfully? (--adapted-dir should be the output_dir it printed)")
         sys.exit(1)
 
     print(f"==> reading adapted VTU: {adapted_vtu_path}")
@@ -223,10 +231,10 @@ def cmd_review(args):
         print(f"==> approved. Adapted Fluent case ready at: {adapted_cas_path}")
         if not os.path.exists(adapted_cas_path):
             print(f"    WARNING: that file doesn't actually exist yet at this path -- "
-                  f"check the SCOREC-side output / adapted_cas_name in case_config.")
+                  f"check run_on_scorec.sh's output (see logs/simmetrix.log in this same dir).")
     else:
         print("==> not approved. Go back to `driver.py plan` (edit region_spec.json to fix the "
-              "regions responsible for the bad area) and re-run the SCOREC round trip.")
+              "regions responsible for the bad area) and re-run.")
 
 
 def main():
@@ -235,7 +243,7 @@ def main():
 
     p_plan = sub.add_parser(
         "plan",
-        help="detect features -> region_spec -> size field -> visualize -> export -> generate SCOREC run script",
+        help="detect features -> region_spec -> size field -> visualize -> export -> run adaptation",
     )
     p_plan.add_argument("--case-config", required=True)
     p_plan.add_argument("--auto-llm", action="store_true",
@@ -247,10 +255,10 @@ def main():
     p_plan.add_argument("--out-dir", default=None)
     p_plan.set_defaults(func=cmd_plan)
 
-    p_review = sub.add_parser("review", help="visualize the adapted VTU handed back from SCOREC and approve/reject it")
+    p_review = sub.add_parser("review", help="visualize the adapted mesh and approve/reject it")
     p_review.add_argument("--case-config", required=True)
     p_review.add_argument("--adapted-dir", required=True,
-                           help="local dir generate_scorec_run_script.py scp'd results into")
+                           help="output_dir that `driver.py plan` printed (run_adaptation's output)")
     p_review.add_argument("--yes", action="store_true")
     p_review.set_defaults(func=cmd_review)
 

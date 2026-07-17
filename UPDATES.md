@@ -1,148 +1,200 @@
-# UPDATES — SCOREC-side Simmetrix work (this session)
+# UPDATES — current state of the SCOREC-side pipeline
 
-Context: this session ran directly on `lore.scorec.rpi.edu` and built/extended
-the C++ side of the pipeline (`simmetrix/`), then wired two new
-`case_config.py` fields through `generate_scorec_run_script.py` so the
-remote-run contract actually produces all three handoff files (adapted
-mesh, VTU, Fluent .cas). Read this before touching any `case_config.json`
-or the SCOREC remote-run scripts.
+Context: this whole repo now runs on one machine (`lore.scorec.rpi.edu`) —
+there is no separate "local sandbox" that hands a script to a human to run
+elsewhere. `pipeline/driver.py` runs feature extraction through mesh
+adaptation as one flow, invoking the Simmetrix C++ side directly as a
+subprocess. Read this before touching `case_config.json`, `pipeline/`, or
+`simmetrix/`.
 
-## What's new
+## 1. `simmetrix/` — the Simmetrix C++ side
 
-### 1. `simmetrix/` — the actual Simmetrix C++ program
-
-- **`simmetrix/src/apply_aniso_size_field.cpp`** — reads `model.smd` +
-  `mesh.sms`, maps each row of a size-field text file to its nearest mesh
-  vertex via a nanoflann KD-tree (`simmetrix/src/nanoflann.hpp`, vendored,
-  BSD-licensed), calls `MSA_setAnisoVertexSize`, runs `MSA_adapt`, then runs
-  `VolumeMeshImprover` with `ShapeMetricType_VolLenRatio` target `0.3` (the
-  only shape metric Simmetrix's docs say is properly supported on an
+- **`simmetrix/src/apply_aniso_size_field.cpp`** — reads a native model +
+  `model.smd` + `mesh.sms`, maps each row of a size-field text file to its
+  nearest mesh vertex via a nanoflann KD-tree (`simmetrix/src/nanoflann.hpp`,
+  vendored, BSD-licensed), calls `MSA_setAnisoVertexSize`, runs `MSA_adapt`,
+  then `VolumeMeshImprover` with `ShapeMetricType_VolLenRatio` target `0.3`
+  (the only shape metric Simmetrix's docs say is properly supported on an
   anisotropic mesh), writes the adapted `.sms`, and writes `adapted.vtu`
-  **directly** — no Simmetrix `meshExporter` plugin for VTU was available,
-  so this walks `M_regionIter`/`R_topoType`/`R_vertices` itself (supports
-  tet/pyramid/wedge/hex; anything else is skipped with a warning, not a
-  crash).
-  - Usage: `apply_aniso_size_field <model.smd> <mesh.sms> <size_field.txt> <output_dir>`
+  **directly** (no Simmetrix `meshExporter` plugin for VTU exists — this
+  walks `M_regionIter`/`R_topoType`/`R_vertices` itself; supports
+  tet/pyramid/wedge/hex, anything else is skipped with a warning).
+  - Usage: `apply_aniso_size_field <native_model> <model.smd> <mesh.sms> <size_field.txt> <output_dir>`
+  - `native_model` (e.g. a Parasolid `.x_t`) is required — `GM_load()` on
+    this project's real Parasolid-backed `.smd` files fails outright
+    without it ("Unable to read resource of type
+    model.nonmanifold.parasolid"), confirmed against real test cases.
+    Loaded via `ParasolidNM_createFromFile()` + `SimParasolid_start(1)`,
+    same pattern as `exAnisoCyl_Parasolid.cc`.
   - Writes: `<output_dir>/adapted.vtu`, `<output_dir>/adapted_mesh/adapted.sms`, `<output_dir>/logs/simmetrix.log`
   - `size_field.txt` format: one line per point, `X Y Z m00 m01 m02 m10 m11
     m12 m20 m21 m22` (12 whitespace/comma-separated numbers; `#` comments
-    and blank lines OK; no header) — this exactly matches what
-    `pipeline/export_for_simmetrix.py` already writes.
-  - Usage is actually `apply_aniso_size_field <native_model> <model.smd>
-    <mesh.sms> <size_field.txt> <output_dir>` — a real end-to-end run (see
-    "smoke test" below) found that `GM_load()` on this project's real
-    Parasolid-backed `.smd` files fails outright ("Unable to read resource
-    of type model.nonmanifold.parasolid") unless the native geometry
-    (`.x_t`) is loaded via `ParasolidNM_createFromFile()` and passed in,
-    bracketed by `SimParasolid_start(1)`/`SimParasolid_stop(1)` — exactly
-    the pattern `exAnisoCyl_Parasolid.cc` uses. Fixed; `simmetrix/CMakeLists.txt`
-    now also sets `SIM_PARASOLID ON` so the Parasolid kernel actually links.
-  - Builds cleanly against SimModSuite 2026.0-260411
-    (`simmetrix/CMakeLists.txt`, using the same `FindSimModSuite.cmake`
-    module as `exampleCMakeList.txt`), and has now been **run for real** —
-    see "smoke test" below.
+    and blank lines OK; no header) — matches what
+    `pipeline/export_for_simmetrix.py` writes.
+  - Builds against SimModSuite 2026.0-260411 (`simmetrix/CMakeLists.txt`,
+    `SIM_PARASOLID ON`, same `FindSimModSuite.cmake` as `exampleCMakeList.txt`).
 
-- **`simmetrix/run_on_scorec.sh`** (new) — the actual remote entry point.
-  Loads the module set `apply_aniso_size_field` was built against
+- **`simmetrix/run_on_scorec.sh`** — the single entry point everything else
+  calls. Loads the module set `apply_aniso_size_field` was built against
   (`gcc/13.2.0-4eahhas`, `mpich/4.2.3-62uy3hd`,
-  `simmetrix-simmodsuite/2026.0-260411-3dtgxhh`), runs
-  `apply_aniso_size_field`, then loads `simmetrix/simModeler/2026.0-260411`
-  (confirmed the correct module for this SimModSuite version — not 2025.1,
-  which an older example elsewhere in this environment used) and runs
-  `translateToCas.py` through `SimModelerScript` to produce `adapted.cas`.
+  `simmetrix-simmodsuite/2026.0-260411-3dtgxhh`), runs it, then loads
+  `simmetrix/simModeler/2026.0-260411` (confirmed correct for this
+  SimModSuite version — not 2025.1) and runs `translateToCas.py` through
+  `SimModelerScript` to produce `adapted.cas`.
   - Usage: `run_on_scorec.sh <native_model.x_t> <model.smd> <mesh.sms> <size_field.txt> <output_dir>`
-  - This is what `generate_scorec_run_script.py` now invokes over ssh —
-    **not** `apply_aniso_size_field` directly (the plain executable alone
-    never produces the .cas).
+  - Invoked directly as a subprocess by `pipeline/run_adaptation.py` — not
+    over ssh, since everything is one machine now.
 
-- **`simmetrix/translateToCas.py`** — pre-existing, unchanged. Fluent .cas
-  exporter via SimModelerScript's `simmetrix` Python module
-  (`SimParasolidNativeModel` / `SimGModel` / `SimMesh` /
-  `meshExporter("FLUENT")`). Needs the **adapted** mesh (not the original
-  input mesh) as its `mesh_file` arg — `run_on_scorec.sh` passes
-  `<output_dir>/adapted_mesh/adapted.sms`.
+- **`simmetrix/translateToCas.py`** — Fluent .cas exporter via
+  SimModelerScript's `simmetrix` Python module (`SimParasolidNativeModel` /
+  `SimGModel` / `SimMesh` / `meshExporter("FLUENT")`). Takes the *adapted*
+  mesh (not the original input) as its `mesh_file` arg.
 
-### 2. `pipeline/case_config.py` — two new required `scorec` fields
+- **`simmetrix/src/extrude.cc`** + **`simmetrix/extrude/CMakeLists.txt`** —
+  a separate tool: takes an existing mesh + model, extracts the 2D
+  triangulation classified on a given source face, and re-extrudes it into
+  a fresh mixed-element volume mesh of a given thickness
+  (`ExtrusionSizing_LayerSize`) between that face and a destination face.
+  Usage: `extrude NAT_MODEL MODEL.smd MESH.sms SRC_FACE DST_FACE OUTMESH.sms THICKNESS`
+  (face tags are model-specific — find them by enumerating `GM_faceIter`
+  faces' centers/normals if not already known).
+  - **Builds against a *different* core/PUMI checkout than everything
+    else**: `apply_aniso_size_field` links raw SimModSuite directly, but
+    `extrude.cc` also needs the SCOREC `core`/PUMI stack (`apf`, `gmi_sim`,
+    etc.). The original prebuilt `core` at
+    `/users/gordoz2/lore.scorec.rpi.edu/core` is on `master`, built against
+    **SimModSuite 2025.1**/`mpich4.1.1` (see its `config.sh`) — genuinely
+    cannot read this project's 2026-format `.smd` files (confirmed
+    independently with a bare `GM_load()`, same error as above). So a
+    **separate clone** exists at
+    `/users/gordoz2/lore.scorec.rpi.edu/core-2026`, checked out to
+    `develop` (merges PR #534 "support simModSuite 2026" — confirmed via
+    `libSimParasolid381.a`), built against SimModSuite 2026.0-260411 to
+    match everything else. `simmetrix/extrude/CMakeLists.txt` points at
+    `core-2026`. **The original `core/` is untouched** (still `master`,
+    still 2025.1) — don't repoint anything at it for this project's model
+    files, and don't delete/rebuild it.
+  - A real run (`testCases/ramp2`, the adapted mesh, faces 7/8, thickness
+    0.006) succeeded: `Number of Region Extrusions identified: 1`,
+    `Created 1569 volume extrusion elements.`, exit 0.
 
-- **`native_model`** — absolute remote path to the CAD kernel's native
-  geometry file (e.g. a Parasolid `.x_t`). Needed only for the .cas export
-  step (`translateToCas.py`'s `nat_mod_file` arg) — `apply_aniso_size_field`
-  itself doesn't need it (loads `model_smd` directly, no native model).
-- **`run_on_scorec_script`** — absolute remote path to
-  `simmetrix/run_on_scorec.sh`.
-- Both validated the same way as `model_smd`/`mesh_sms`/etc (must be
-  absolute paths). `EXAMPLE_CASE_CONFIG` updated to show both.
-- **Any `case_config.json` written before this session is now invalid** —
-  `validate_case_config()` will raise `CaseConfigError` for missing
-  `native_model`/`run_on_scorec_script` until those are added.
+## 2. `pipeline/` — the Python side (runs on this same machine)
 
-### 3. `pipeline/generate_scorec_run_script.py` — updated to match
+- **`pipeline/case_config.py`** — flat schema, no more `scorec`/`host`/
+  `user` nesting (there's nothing remote to address anymore). Required:
+  `case_name`, `vtu_path`, `driver_fields`, `hmin`, `hmax`, `native_model`,
+  `model_smd`, `mesh_sms`, `run_on_scorec_script`, `work_dir` — all plain
+  absolute local paths. `apply_aniso_exe` is optional (only needed to
+  override `run_on_scorec.sh`'s own default build path).
+  `ADAPTED_VTU_NAME`/`ADAPTED_CAS_NAME` are fixed constants
+  (`"adapted.vtu"`/`"adapted.cas"`) matching what the C++/shell side
+  actually hardcodes — not configurable, despite an earlier version of
+  this file pretending they were.
+- **`pipeline/run_adaptation.py`** (replaces the old
+  `generate_scorec_run_script.py`, which is deleted) — runs
+  `run_on_scorec_script` directly via `subprocess.run`, no ssh/scp. Returns
+  `{"output_dir", "adapted_vtu", "adapted_cas", "adapted_sms"}`. Raises
+  `AdaptationError` if the script fails or `adapted.vtu` doesn't show up.
+- **`pipeline/driver.py`** — `plan` now runs adaptation directly at the end
+  (feature extraction → region_spec → size field → **run_adaptation()** →
+  prints where the adapted VTU/cas landed) instead of generating a script
+  for a human to run elsewhere. `review` reads that same local directory.
+  Both commands otherwise work the same as before.
+- **Verified for real**: `run_adaptation()` invoked against
+  `testCases/ramp2`'s real files (`ramp_nat.x_t`, `ramp.smd`,
+  `ramp-initial.sms`, `size_field_final.txt`) → exit 0, produced real
+  `adapted.vtu` (239 KB), `adapted.cas` (446 KB), `adapted_mesh/adapted.sms`
+  (1.1 MB), `logs/simmetrix.log`. This is the actual code path
+  `driver.py plan` now runs, not a mock.
+- **Any `case_config.json` written before this refactor is invalid** under
+  the new flat schema — needs `native_model`/`model_smd`/`mesh_sms`/
+  `run_on_scorec_script`/`work_dir` at the top level, no `scorec` wrapper.
 
-- The generated shell script now runs
-  `${RUN_ON_SCOREC_SCRIPT} ${NATIVE_MODEL} ${MODEL_SMD} ${MESH_SMS}
-  ${REMOTE_WORK_DIR}/size_field.txt ${REMOTE_WORK_DIR}/output` instead of
-  calling `apply_aniso_exe` directly.
-- Fixed an unrelated pre-existing self-test bug while in here: an assertion
-  checked for a bare `ssh "${USER}@${HOST}"` substring the template never
-  actually emits (`${SSH_OPTS[@]}` is always between them).
-- `apply_aniso_exe` is still a valid field in case_config (still useful for
-  manual testing, and `run_on_scorec.sh` accepts an `APPLY_ANISO_EXE` env
-  override), it's just no longer what the generated script invokes
-  directly.
+## Python environment for pipeline/
 
-All pipeline self-tests (`python3 <module>.py` for every file in
-`pipeline/`) pass as of this update, plus a full `py_compile` sweep.
+The system Python here has no working `pip` at all (`python3 -m pip` →
+`No module named pip`, no `pip` binary on PATH, even under the `python`
+spack module) and lacks `meshio`/`scipy`. Rather than fight that, a fresh
+Miniconda was installed, self-contained, under this user's home dir (does
+NOT touch the old `/opt/scorec/intel/intelpython3` conda 4.3.31 install,
+which is separate and ancient):
 
-## Smoke test — actually run, end to end (not just compiled)
+```
+/users/gordoz2/lore.scorec.rpi.edu/miniconda3            -- conda 26.5.3
+/users/gordoz2/lore.scorec.rpi.edu/miniconda3/envs/llmesh -- python 3.11, meshio 5.3.5, scipy 1.17.1, numpy 2.4.6
+```
 
-Ran the real chain against `testCases/ramp/` (`ramp_nat.x_t`, `ramp.smd`,
-`ramp-initial.sms`, real license via `$SIM_LICENSE_FILE`):
+Run pipeline/driver.py with:
+```
+/users/gordoz2/lore.scorec.rpi.edu/miniconda3/bin/conda run -n llmesh python3 driver.py plan --case-config ...
+```
+or `conda activate llmesh` first (needs `source .../miniconda3/etc/profile.d/conda.sh` in a non-interactive shell).
 
-1. Built a throwaway vertex-dump tool (same GM_load/M_load pattern) to get
-   `ramp-initial.sms`'s actual 3926 vertex coordinates, then wrote a
-   `size_field.txt` using those exact coordinates (isotropic, background
-   size ≈ 2% of the model's bbox diagonal) — this is what caught the
-   missing-native-model bug above on the first real attempt.
-2. `apply_aniso_size_field ramp_nat.x_t ramp.smd ramp-initial.sms
-   size_field.txt <out>` → **exit 0**. Nearest-vertex mapping distance
-   min=0, max=5e-10 (floating-point noise — confirms exact coordinate
-   correspondence). `MSA_adapt` ran 7 iterations (3926 → 21184 vertices,
-   111126 tets), `VolumeMeshImprover` completed. Both `adapted.vtu` (valid
-   XML, point/cell/connectivity counts internally consistent — verified
-   with `xml.etree`) and `adapted_mesh/adapted.sms` written.
-3. Full `run_on_scorec.sh ramp_nat.x_t ramp.smd ramp-initial.sms
-   size_field.txt <out>` → **exit 0**. Ran the above, then
-   `SimModelerScript -python translateToCas.py` produced `adapted.cas` — a
-   valid Fluent case file whose cell count (`0x1b216` = 111126) matches the
-   VTU exactly.
+For anyone else cloning this repo (not this same home dir): `pipeline/environment.yml` + `pipeline/setup_env.sh` recreate the same env from scratch --
+```
+bash pipeline/setup_env.sh   # creates (or updates) the "llmesh" env from environment.yml
+conda activate llmesh
+```
+(requires conda already on PATH; get Miniconda from
+https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh if not).
 
-So the whole chain (adapt → VolumeMeshImprover → VTU → Fluent .cas) is
-confirmed working on a real Parasolid-backed test case, not just compiled.
-This test used a synthetic isotropic size field for coverage, not a real
-CFD-driven anisotropic one — that's still untested end-to-end (needs the
-Python side's `export_for_simmetrix.py` output, which needs `meshio`,
-which isn't installed in this sandbox).
+### Full pipeline verified end-to-end on real CFD data
+
+Ran `driver.py plan` + `driver.py review` against `testCases/ramp2/initEx.vtu`
+(a real Fluent/CFD solution VTU for the ramp2 case — wedge/quad/triangle
+cells, 3944 points, fields: density/pressure/mach_number/temperature/
+velocity/etc, matching `ramp-initial.sms`'s vertex count) using
+`case_config.json` in that same directory:
+
+1. `plan` (first run, no region_spec.json yet): read the real VTU,
+   extracted features on `["pressure", "mach_number"]` — found 2 and 3
+   candidate regions respectively, all consistent with a single oblique
+   shock (matching gradient directions across both fields) plus smaller
+   secondary features. Wrote `feature_summary.json` and paused as designed.
+2. Authored `region_spec.json` by hand from that real feature summary (one
+   `plane`-shaped region at the dominant shock's centroid/gradient
+   direction, tight normal size 0.001, background 0.03).
+3. `plan` (second run, `--yes`): built the size field, ran the real
+   adaptation (`MSA_adapt` + `VolumeMeshImprover`, exit 0), ran the real
+   Fluent .cas export — wrote `adapted.vtu` (701 pts / 1883 tets),
+   `adapted.cas`, `adapted_mesh/adapted.sms`.
+4. `review --yes`: read the adapted VTU back, wrote the mesh-review HTML
+   viewer, approved, reported the `.cas` path. Exit 0.
+
+So this is no longer just structurally ready — the entire
+VTU→features→region_spec→size_field→adapt→VTU/.cas loop has been run for
+real, on real CFD data, on this machine, start to finish.
 
 ## Still open
-
 - The VTU writer's vertex ordering for pyramid/wedge/hex regions uses
   Simmetrix's `R_vertices(region, 1)` ordering as-is; tet ordering is
-  standard and now proven correct end-to-end above, but the other three
-  haven't been exercised (the ramp test case is pure tet) or visually
-  verified against VTK's expected node order in ParaView — worth checking
-  on the first mixed-element mesh that goes through it.
-- A real anisotropic size field (from the actual CFD/feature-extraction
-  pipeline, not a synthetic isotropic one) hasn't been run through this
-  yet.
+  proven correct end-to-end, but the other three haven't been exercised
+  (test cases so far are pure tet) or visually verified in ParaView.
+- `extrude.cc`'s `#ifndef NDEBUG` debug dump (`rasp_extrude_surf_mesh.sms`,
+  hardcoded filename, written to cwd) is harmless but worth removing or
+  namespacing if this gets used from more than one working directory at once.
 
-## Directory layout this assumes
+## Directory layout
 
 ```
 simmetrix/
-  CMakeLists.txt
-  run_on_scorec.sh
+  CMakeLists.txt              -- apply_aniso_size_field (SimModSuite 2026.0 only)
+  run_on_scorec.sh             -- entry point: adapt + VTU + Fluent .cas
   translateToCas.py
   src/apply_aniso_size_field.cpp
+  src/extrude.cc
   src/nanoflann.hpp
-  build/apply_aniso_size_field   (built artifact, gitignored)
+  extrude/CMakeLists.txt       -- extrude (SimModSuite 2026.0 + core-2026/PUMI)
+  build/, extrude/build/       -- built artifacts, gitignored
+
+pipeline/
+  case_config.py       -- flat, single-machine schema
+  driver.py             -- plan / review CLI, runs everything here
+  run_adaptation.py     -- subprocess call into simmetrix/run_on_scorec.sh
+  vtu_io.py, feature_extraction.py, region_spec.py, llm_region_spec.py,
+  size_field_builder.py, export_for_simmetrix.py, visualization_data.py,
+  visualize_standalone.py
+
+core/          -- original prebuilt PUMI/core checkout, master, SimModSuite 2025.1 -- DO NOT TOUCH
+core-2026/     -- new clone, develop branch, SimModSuite 2026.0 -- what extrude/ links against
 ```

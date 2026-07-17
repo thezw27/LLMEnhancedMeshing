@@ -74,6 +74,7 @@ hmax clamping, and the optional aspect-ratio cap.
 from __future__ import annotations
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 from vtu_io import vertex_adjacency
 
@@ -390,9 +391,227 @@ def _build_centerline(points_comp: np.ndarray, min_bin: int = 8, min_bins: int =
     return np.array(centerline) if centerline else points_comp
 
 
+def _densify_centerline(centerline: np.ndarray, target_spacing: float) -> np.ndarray:
+    """Insert linearly-interpolated points between consecutive (already
+    PCA-ordered) centerline points wherever they're farther apart than
+    target_spacing.
+
+    This exists to fill gaps in a detected feature's own coverage, in two
+    ways that show up identically in the output: (1) percentile-threshold
+    detection can miss a stretch of an otherwise-continuous real shock -- a
+    local dip in gradient magnitude below the cutoff, often just from
+    locally coarser solution data -- leaving a real hole in the middle of an
+    otherwise well-detected feature (confirmed on this pipeline's own ramp2
+    case: the secondary shock's own detected vertices have several internal
+    gaps up to 0.0045, comparable to its own core+falloff width of 0.0065);
+    and (2) _build_centerline's own binning resolution can be coarse
+    relative to a narrow core+falloff band for a long feature, which -- since
+    distance is measured to the *nearest single centerline point*, not a
+    continuous nearest-point-on-segment projection -- can show up as
+    "bumpy"/inconsistent-looking refinement along an otherwise smoothly
+    curving feature purely from that discretization, not from anything
+    physically real.
+
+    Filling with straight-line interpolation between two points already
+    trusted on both sides (real detections or already-smoothed bin centers)
+    is safe in a way extrapolating past an end is not: there's no risk of
+    inventing a trend unsupported by data, since both endpoints of every
+    inserted segment are real.
+    """
+    n = len(centerline)
+    if n < 2 or target_spacing <= 1e-12:
+        return centerline
+    out = [centerline[0]]
+    for i in range(1, n):
+        a, b = centerline[i - 1], centerline[i]
+        seg_len = np.linalg.norm(b - a)
+        if seg_len > target_spacing:
+            n_extra = int(np.floor(seg_len / target_spacing))
+            for k in range(1, n_extra + 1):
+                t = k / (n_extra + 1)
+                out.append(a + (b - a) * t)
+        out.append(b)
+    return np.array(out)
+
+
+def _smooth_directions_along_component(points_comp: np.ndarray, dirs: np.ndarray, k: int = 6) -> np.ndarray:
+    """Average each detected vertex's own raw local-gradient direction with
+    its k nearest neighbors *within the same component*, re-normalizing.
+
+    Each vertex's raw direction comes from an independent local
+    weighted-least-squares gradient (compute_vertex_gradient) -- fine for
+    finding the feature at all, but noisy vertex-to-vertex, especially at
+    the sparser ends of a detected component or near a complex flow feature
+    (e.g. a shock reflection point), where a single vertex's neighborhood is
+    small/asymmetric enough that its individual gradient direction estimate
+    is poorly constrained. Direction jitter there looks like sudden 60-90
+    degree swings in anisotropy axis between adjacent vertices in the
+    output field -- not a real physical feature, just estimation noise.
+    Averaging with nearby real detections along the same feature (not
+    across unrelated features -- that's why this is per-component) damps
+    that noise while still tracking genuine curvature, since a real bend
+    changes direction gradually across many neighboring vertices rather
+    than vertex-to-vertex.
+
+    Sign handling: two vertices whose true normal direction is the same
+    physical axis can have raw gradient vectors pointing to *opposite*
+    sides (the field could be increasing or decreasing across the front
+    depending on which side is which) -- naively averaging opposite vectors
+    would cancel instead of reinforcing. Signs are aligned against the
+    component's single strongest-gradient vertex before averaging, which is
+    robust for the smoothly-curving, non-self-intersecting shocks this
+    pipeline targets.
+    """
+    n = len(points_comp)
+    if n < 2:
+        return dirs
+    anchor = dirs[0]
+    mags = np.linalg.norm(dirs, axis=1)
+    if n > 0:
+        anchor = dirs[np.argmax(mags)] if mags.max() > 1e-15 else dirs[0]
+    signs = np.sign(dirs @ anchor)
+    signs[signs == 0] = 1.0
+    aligned = dirs * signs[:, None]
+
+    tree = cKDTree(points_comp)
+    kk = min(k, n)
+    _, nbr_idx = tree.query(points_comp, k=kk)
+    if kk == 1:
+        nbr_idx = nbr_idx[:, None]
+    smoothed = aligned[nbr_idx].mean(axis=1)
+    norms = np.linalg.norm(smoothed, axis=1, keepdims=True)
+    norms_safe = np.where(norms < 1e-15, 1.0, norms)
+    return smoothed / norms_safe
+
+
+def _centerline_tangents(centerline: np.ndarray) -> np.ndarray:
+    """Unit tangent at each centerline point via central differences (one-
+    sided at the two ends). Centerline is assumed already ordered along its
+    own dominant direction (true for both _build_centerline's output and
+    _extend_centerline's extrapolated points, which preserve that order)."""
+    n = len(centerline)
+    if n < 2:
+        return np.tile(np.array([1.0, 0.0, 0.0]), (max(n, 1), 1))
+    tang = np.zeros((n, 3))
+    tang[0] = centerline[1] - centerline[0]
+    tang[-1] = centerline[-1] - centerline[-2]
+    if n > 2:
+        tang[1:-1] = centerline[2:] - centerline[:-2]
+    norms = np.linalg.norm(tang, axis=1, keepdims=True)
+    norms[norms < 1e-15] = 1.0
+    return tang / norms
+
+
+def _extend_centerline(points_comp: np.ndarray, centerline: np.ndarray,
+                        bbox_min: np.ndarray, bbox_max: np.ndarray,
+                        max_extend_distance: float,
+                        fit_degree: int = 2, max_extra_per_side: int = 60) -> np.ndarray:
+    """Extrapolate a detected feature's smoothed centerline beyond its own
+    raw-detected extent, following the curve's own measured trend/bend
+    rather than stopping wherever raw gradient-threshold detection happened
+    to run out.
+
+    Why this matters: percentile-threshold + connected-component detection
+    only ever reports vertices that cleared today's specific threshold on
+    today's specific (possibly locally coarser) mesh -- a real physical
+    feature can and does continue past that point (confirmed on this
+    pipeline's own ramp2 case: gradient magnitude at the last few detected
+    trailing-end vertices of the secondary shock was no smaller than
+    magnitude earlier along the same shock, i.e. the signal wasn't fading,
+    detection just ran out of qualifying mesh vertices).
+
+    max_extend_distance bounds this (per side, in the same physical
+    distance units as the mesh) rather than extrapolating open-endedly out
+    to the mesh's bounding box. An earlier version of this function did
+    exactly that -- extrapolate until leaving the bounding box -- and it
+    produced a real, confirmed bug: a *reflected* shock's own leading
+    (upstream) end is a genuine physical origin point (it cannot exist
+    upstream of wherever it reflects), not a detection artifact, and its
+    gradient magnitude there is just as strong as everywhere else along the
+    shock (1.3M, no different from the rest) -- so there's no local signal
+    that distinguishes "detection stopped early" from "the feature actually
+    ends here," and the quadratic fit happily extrapolated it backward
+    through nearly the entire domain before the bounding-box check finally
+    caught it. Bounding the extrapolation to a modest, self-scaling distance
+    instead (the call site ties this to the region's own influence scale,
+    e.g. a multiple of core+falloff) still bridges the kind of gap that
+    motivated this function in the first place, without ever being able to
+    manufacture a feature spanning most of the domain regardless of what the
+    real detected data actually supports.
+    """
+    n = len(centerline)
+    if n < 3 or max_extend_distance <= 1e-12:
+        return centerline
+    centroid = points_comp.mean(axis=0)
+    _, _, vt = np.linalg.svd(points_comp - centroid, full_matrices=False)
+    along = vt[0]
+    s = (centerline - centroid) @ along
+    order = np.argsort(s)
+    s_sorted = s[order]
+    cl_sorted = centerline[order]
+
+    deg = min(fit_degree, n - 1)
+    coeffs = [np.polyfit(s_sorted, cl_sorted[:, k], deg) for k in range(3)]
+    step = np.median(np.diff(s_sorted))
+    if not np.isfinite(step) or step <= 1e-12:
+        return cl_sorted
+
+    def in_bbox(p):
+        return bool(np.all(p >= bbox_min - 1e-9) and np.all(p <= bbox_max + 1e-9))
+
+    extra_lo = []
+    s_cur = s_sorted[0]
+    s_start = s_cur
+    for _ in range(max_extra_per_side):
+        s_cur -= step
+        if abs(s_cur - s_start) > max_extend_distance:
+            break
+        p = np.array([np.polyval(coeffs[k], s_cur) for k in range(3)])
+        if not in_bbox(p):
+            break
+        extra_lo.append(p)
+
+    extra_hi = []
+    s_cur = s_sorted[-1]
+    s_start = s_cur
+    for _ in range(max_extra_per_side):
+        s_cur += step
+        if abs(s_cur - s_start) > max_extend_distance:
+            break
+        p = np.array([np.polyval(coeffs[k], s_cur) for k in range(3)])
+        if not in_bbox(p):
+            break
+        extra_hi.append(p)
+
+    pieces = []
+    if extra_lo:
+        pieces.append(np.array(extra_lo[::-1]))
+    pieces.append(cl_sorted)
+    if extra_hi:
+        pieces.append(np.array(extra_hi))
+    return np.concatenate(pieces, axis=0)
+
+
+def _falloff_weight_vec(distance: np.ndarray, core: float, falloff: float) -> np.ndarray:
+    """Vectorized form of _falloff_weight (same smootherstep math), used to
+    score every mesh vertex against a region's influence in one call instead
+    of one Python-level scalar call per vertex."""
+    w = np.zeros_like(distance)
+    w[distance <= core] = 1.0
+    if falloff <= 1e-12:
+        return w
+    mask = (distance > core) & (distance < core + falloff)
+    t = (distance[mask] - core) / falloff
+    w[mask] = 1.0 - (3 * t ** 2 - 2 * t ** 3)
+    return w
+
+
+_AUTO_COARSEN_MULTIPLIER = 1.5  # see coarsen_distance docstring below
+
+
 def build_auto_size_field(mesh: dict, spec: dict, driver_fields: list[str],
                            gradient_percentile: float = 90.0, outlier_ratio: float = 1.5,
-                           coarsen_distance: float = 0.05,
+                           coarsen_distance: float | None = None,
                            max_aspect_ratio: float | None = None,
                            sizing_driver_field: str | None = None) -> dict:
     """Auto-driven build path -- see the module docstring for the full
@@ -404,9 +623,22 @@ def build_auto_size_field(mesh: dict, spec: dict, driver_fields: list[str],
 
     coarsen_distance: extra distance beyond a feature's core+falloff over
     which the background grows from background_size to hmax (smootherstep).
-    Not something the human specified numerically, so this is a deliberately
-    modest default (a few multiples of a typical falloff_distance) -- the
-    call site should say so rather than imply it was requested.
+    Left as None by default -- an earlier version of this function used one
+    fixed absolute number (0.05) shared by every region regardless of that
+    region's own scale, which meant a domain/feature-size mismatch (a case
+    with a much bigger or smaller domain, or a much narrower/wider shock
+    band, than whatever the 0.05 was originally tuned against) would silently
+    over- or under-coarsen -- confirmed on this pipeline's own ramp2 case: a
+    flat 0.05 left the majority of the domain sitting in a "still transitioning,
+    not yet coarse" state relative to a real reference adapted mesh, regardless
+    of growth_rate. When left None, each region instead gets its own
+    coarsen_distance = _AUTO_COARSEN_MULTIPLIER * (that region's own
+    core_distance + falloff_distance) -- i.e. "start coarsening toward hmax
+    shortly after this specific feature's own influence band ends," which
+    scales automatically with whatever core/falloff the human/LLM sets for
+    ANY case's regions instead of requiring a hand-picked absolute distance
+    per case. Pass an explicit float to override this per-region default with
+    one shared absolute value (the old behavior).
 
     sizing_driver_field: decouples *where* features are found from *what
     field's local gradient magnitude sets the consistent-normal-size
@@ -447,81 +679,156 @@ def build_auto_size_field(mesh: dict, spec: dict, driver_fields: list[str],
         )[sizing_driver_field]
         sizing_grad_mag = np.linalg.norm(sizing_grad, axis=1)
 
-    feat_points, feat_dirs, feat_hnorm, feat_t1, feat_t2, feat_core, feat_fall, feat_region = [], [], [], [], [], [], [], []
-    centerline_trees = []  # one per region, indexed to match feat_region values
+    # per-region derived data: extended (extrapolated) centerline + tangents
+    # for weighting/direction, and the *real* detected vertices' own smoothed
+    # direction/size for whatever's nearby enough to trust as real data.
+    domain_bbox_min = points.min(axis=0)
+    domain_bbox_max = points.max(axis=0)
+
+    region_core, region_fall, region_ts, region_coarsen_distance = [], [], [], []
+    region_ext_tree, region_ext_tangents = [], []
+    region_real_tree, region_real_dirs, region_real_hnorm = [], [], []
+
     for region_idx, region in enumerate(spec["regions"]):
         if not components:
             break
         ref = _shape_reference_point(region["shape"])
         dists = [np.linalg.norm(c["centroid"] - ref) for c in components]
         comp = components[int(np.argmin(dists))]
+        comp_points = points[comp["vertex_ids"]]
 
-        centerline_trees.append(cKDTree(_build_centerline(points[comp["vertex_ids"]])))
+        core_d = region["influence"]["core_distance"]
+        fall_d = region["influence"]["falloff_distance"]
+        region_core.append(core_d)
+        region_fall.append(fall_d)
+        region_coarsen_distance.append(
+            coarsen_distance if coarsen_distance is not None else _AUTO_COARSEN_MULTIPLIER * (core_d + fall_d)
+        )
 
         ts = region["target_size"]
+        region_ts.append(ts)
         h_base = ts["normal"]
         grad_mag_for_sizing = (
             sizing_grad_mag[comp["vertex_ids"]] if sizing_grad_mag is not None else comp["grad_mag"]
         )
         h_normals = _consistent_normal_sizes(grad_mag_for_sizing, h_base, hmin, outlier_ratio)
-        dirs = comp["grad"] / np.maximum(np.linalg.norm(comp["grad"], axis=1, keepdims=True), 1e-15)
 
-        for i, vid in enumerate(comp["vertex_ids"]):
-            feat_points.append(points[vid])
-            feat_dirs.append(dirs[i])
-            feat_hnorm.append(h_normals[i])
-            feat_t1.append(ts["tangential_1"])
-            feat_t2.append(ts["tangential_2"])
-            feat_core.append(region["influence"]["core_distance"])
-            feat_fall.append(region["influence"]["falloff_distance"])
-            feat_region.append(region_idx)
+        raw_dirs = comp["grad"] / np.maximum(np.linalg.norm(comp["grad"], axis=1, keepdims=True), 1e-15)
+        # smooth away single-vertex direction noise (see docstring) before
+        # this becomes the reference direction anywhere in the field
+        smoothed_dirs = _smooth_directions_along_component(comp_points, raw_dirs)
+
+        base_centerline = _build_centerline(comp_points)
+        # fill internal gaps/coarse-binning holes (real detection dropouts
+        # or just resolution too coarse relative to this region's own tight
+        # zone) before extension -- see _densify_centerline's docstring.
+        # target_spacing scales off the region's own core+falloff, same
+        # self-scaling approach used elsewhere in this function, so a
+        # different case's much narrower or wider influence band gets a
+        # sensibly-scaled target without hand-tuning.
+        target_spacing = 0.5 * (core_d + fall_d)
+        base_centerline = _densify_centerline(base_centerline, target_spacing)
+        # bound extrapolation to a modest, self-scaling distance tied to
+        # this region's own influence scale (same idea as coarsen_distance)
+        # rather than open-ended to the domain's bounding box -- see
+        # _extend_centerline's docstring for the confirmed bug that caused.
+        max_extend = _AUTO_COARSEN_MULTIPLIER * (core_d + fall_d)
+        extended_centerline = _extend_centerline(comp_points, base_centerline, domain_bbox_min, domain_bbox_max, max_extend)
+        tangents = _centerline_tangents(extended_centerline)
+
+        region_ext_tree.append(cKDTree(extended_centerline))
+        region_ext_tangents.append(tangents)
+        region_real_tree.append(cKDTree(comp_points))
+        region_real_dirs.append(smoothed_dirs)
+        region_real_hnorm.append(h_normals)
 
     matrices = np.zeros((n, 3, 3))
-    have_features = len(feat_points) > 0
-    if have_features:
-        feat_points_arr = np.array(feat_points)
-        tree = cKDTree(feat_points_arr)
-        _, idx = tree.query(points, k=1)  # nearest raw feature vertex -> direction/value source
-        feat_dirs = np.array(feat_dirs)
-        feat_hnorm = np.array(feat_hnorm)
-        feat_t1 = np.array(feat_t1)
-        feat_t2 = np.array(feat_t2)
-        feat_core = np.array(feat_core)
-        feat_fall = np.array(feat_fall)
-        feat_region = np.array(feat_region)
+    n_regions = len(region_ext_tree)
+    have_any_region = n_regions > 0
+
+    if have_any_region:
+        # score every mesh vertex against every region's (possibly
+        # extrapolated) centerline in one batched KD-tree query per region,
+        # instead of one Python-level single-point query per mesh vertex --
+        # same math, much faster at this mesh's vertex count.
+        w_all = np.zeros((n_regions, n))
+        d_beyond_all = np.zeros((n_regions, n))
+        idx_ext_all = np.zeros((n_regions, n), dtype=int)
+        idx_real_all = np.zeros((n_regions, n), dtype=int)
+        d_real_all = np.zeros((n_regions, n))
+
+        for r in range(n_regions):
+            d_ext, idx_ext = region_ext_tree[r].query(points, k=1)
+            core, fall = region_core[r], region_fall[r]
+            w_all[r] = _falloff_weight_vec(d_ext, core, fall)
+            d_beyond_all[r] = np.maximum(0.0, d_ext - (core + fall))
+            idx_ext_all[r] = idx_ext
+
+            d_real, idx_real = region_real_tree[r].query(points, k=1)
+            d_real_all[r] = d_real
+            idx_real_all[r] = idx_real
+
+        best_region = np.argmax(w_all, axis=0)
+        best_w = w_all[best_region, np.arange(n)]
+
+        bg_here = np.full(n, bg)
+        for r in range(n_regions):
+            mask_r = best_region == r
+            cd = region_coarsen_distance[r]
+            coarsen_w = np.zeros(n)
+            if cd > 1e-12:
+                coarsen_w[mask_r] = np.minimum(1.0, d_beyond_all[r][mask_r] / cd)
+            bg_here[mask_r] = _lerp(bg, hmax, coarsen_w[mask_r])
+
+        for r in range(n_regions):
+            mask = (best_region == r) & (best_w > 1e-9)
+            if not np.any(mask):
+                continue
+            core, fall = region_core[r], region_fall[r]
+            ts = region_ts[r]
+            h_base = ts["normal"]
+
+            tangents_r = region_ext_tangents[r][idx_ext_all[r][mask]]
+            idx_real_r = idx_real_all[r][mask]
+            d_real_r = d_real_all[r][mask]
+            d_ref = region_real_dirs[r][idx_real_r]
+
+            # direction = the nearest real (smoothed) detected direction,
+            # projected to stay perpendicular to the LOCAL tangent -- a
+            # no-op right at real data (where the tangent already matches),
+            # and what lets direction correctly follow the curve's bend out
+            # into an extrapolated tail where there's no raw vertex to ask.
+            proj = d_ref - np.sum(d_ref * tangents_r, axis=1, keepdims=True) * tangents_r
+            proj_norm = np.linalg.norm(proj, axis=1, keepdims=True)
+            proj_safe = np.where(proj_norm < 1e-9, 1.0, proj_norm)
+            normal_dirs = np.where(proj_norm < 1e-9, d_ref, proj / proj_safe)
+
+            # outlier-tightened sizing only trusted within the real
+            # detection's own influence band; beyond that (extrapolated
+            # tail) there's no real local gradient to check against, so
+            # just use the region's consistent baseline.
+            within_real_band = d_real_r <= (core + fall)
+            h_real = region_real_hnorm[r][idx_real_r]
+            h_n_field = np.where(within_real_band, h_real, h_base)
+
+            w_r = best_w[mask]
+            bg_r = bg_here[mask]
+            h_n = _lerp(bg_r, h_n_field, w_r)
+            h_t1 = _lerp(bg_r, ts["tangential_1"], w_r)
+            h_t2 = _lerp(bg_r, ts["tangential_2"], w_r)
+
+            idxs = np.where(mask)[0]
+            for local_i, global_i in enumerate(idxs):
+                normal = normal_dirs[local_i]
+                t1, t2 = _orthonormal_basis(normal)
+                matrices[global_i, 0] = normal * h_n[local_i]
+                matrices[global_i, 1] = t1 * h_t1[local_i]
+                matrices[global_i, 2] = t2 * h_t2[local_i]
+
+        bg_mask = best_w <= 1e-9
+        matrices[bg_mask] = np.eye(3)[None, :, :] * bg_here[bg_mask][:, None, None]
     else:
-        idx = np.zeros(n, dtype=int)
-
-    for i, p in enumerate(points):
-        if have_features:
-            j = int(idx[i])
-            core, fall = float(feat_core[j]), float(feat_fall[j])
-            # distance for WEIGHT purposes comes from the matched region's
-            # smoothed centerline, not nearest-raw-vertex -- see
-            # _build_centerline's docstring for why that distinction matters.
-            d, _ = centerline_trees[int(feat_region[j])].query(p)
-            d = float(d)
-            w = _falloff_weight(d, core, fall)
-            d_beyond = max(0.0, d - (core + fall))
-        else:
-            w = 0.0
-            d_beyond = 0.0
-
-        coarsen_w = 0.0 if coarsen_distance <= 1e-12 else min(1.0, d_beyond / coarsen_distance)
-        bg_here = _lerp(bg, hmax, coarsen_w)
-
-        if w <= 1e-9:
-            matrices[i] = np.eye(3) * bg_here
-            continue
-
-        normal = feat_dirs[j]
-        t1, t2 = _orthonormal_basis(normal)
-        h_n = _lerp(bg_here, float(feat_hnorm[j]), w)
-        h_t1 = _lerp(bg_here, float(feat_t1[j]), w)
-        h_t2 = _lerp(bg_here, float(feat_t2[j]), w)
-        matrices[i, 0] = normal * h_n
-        matrices[i, 1] = t1 * h_t1
-        matrices[i, 2] = t2 * h_t2
+        matrices[:] = np.eye(3)[None, :, :] * bg
 
     iso_equiv = np.array([np.linalg.norm(m, axis=1).min() for m in matrices])
 

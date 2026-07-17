@@ -181,6 +181,36 @@ def compute_feature_summary(
             g = grad[region_mask]
             g_mean = g.mean(axis=0)
             g_dir = (g_mean / np.linalg.norm(g_mean)).tolist() if np.linalg.norm(g_mean) > 1e-12 else [0, 0, 0]
+
+            # How much this region's own detected vertices actually scatter
+            # cross-feature (perpendicular to its dominant/along-feature PCA
+            # direction) -- this is real, measured data about THIS region on
+            # THIS case, meant to inform core_distance/falloff_distance
+            # instead of reusing a value tuned on a previous, possibly very
+            # different case. A region whose real detected vertices scatter
+            # by several mm needs a core+falloff wide enough to cover most
+            # of that scatter, or most of its own real vertices will only
+            # partially blend toward the requested tight size regardless of
+            # how good detection/smoothing is -- that's a property of the
+            # region's own data, not something core_distance tuning alone
+            # can outrun.
+            scatter_stats = None
+            if len(pts) >= 4:
+                centroid = pts.mean(axis=0)
+                _, _, vt = np.linalg.svd(pts - centroid, full_matrices=False)
+                along = vt[0]
+                perp = (pts - centroid) - np.outer((pts - centroid) @ along, along)
+                perp_dist = np.linalg.norm(perp, axis=1)
+                scatter_stats = {
+                    "median": float(np.median(perp_dist)),
+                    "p90": float(np.percentile(perp_dist, 90)),
+                    "max": float(perp_dist.max()),
+                    "note": ("perpendicular distance of this region's own detected vertices to their "
+                             "dominant (along-feature) PCA direction -- a data-driven starting point for "
+                             "core_distance (~median) and core_distance+falloff_distance (~p90), not a "
+                             "hard rule"),
+                }
+
             regions.append({
                 "n_vertices": int(region_mask.sum()),
                 "bbox_min": pts.min(axis=0).tolist(),
@@ -190,6 +220,7 @@ def compute_feature_summary(
                 "max_gradient_magnitude": float(grad_mag[region_mask].max()),
                 "dominant_gradient_direction": g_dir,  # normal-ish direction across the feature
                 "field_value_range": [float(field[region_mask].min()), float(field[region_mask].max())],
+                "cross_feature_scatter": scatter_stats,
             })
 
         # sort strongest features first so the LLM sees the important ones up front

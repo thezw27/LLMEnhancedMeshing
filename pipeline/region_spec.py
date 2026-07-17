@@ -123,7 +123,7 @@ def validate_region_spec(spec: dict) -> None:
             ts["direction_normal"] = None  # default: infer from shape at build time
 
 
-def defaults_from_case_config(case_config: dict, growth_rate: float = 1.2, background_size: float | None = None) -> dict:
+def defaults_from_case_config(case_config: dict, growth_rate: float = 2.5, background_size: float | None = None) -> dict:
     """Build the region_spec `defaults` block from a case_config's hmin/hmax
     (see case_config.py) — this is the hmin/hmax -> region_spec wiring: the
     human supplies hmin/hmax once per case, and every region_spec authored
@@ -133,8 +133,24 @@ def defaults_from_case_config(case_config: dict, growth_rate: float = 1.2, backg
     regions the LLM/human explicitly call out as needing refinement") unless
     overridden — ask the human if a different background makes more sense
     for a given case (e.g. a uniformly finer far-field for an unsteady case).
-    growth_rate defaults to 1.2 (a common mesh-adaptation gradation rate);
-    also worth confirming with the human per case rather than assuming.
+
+    growth_rate defaults to 2.5, not the more textbook-conservative ~1.2 this
+    used to default to. Measured directly on this pipeline's own ramp2 case
+    against a real reference adapted mesh: at growth_rate=1.2-1.5 the
+    background never gets a real chance to relax back out to hmax across
+    most of the domain (gradation limiting's per-edge cap dominates over
+    the raw coarsening target almost everywhere except right at hmax's own
+    edge), which is exactly the "way too many small elements in places we
+    don't need them" failure mode. Pushing growth_rate up to ~2.5-3.0 nearly
+    doubled the fraction of the domain actually reaching hmax with no
+    measurable change to anisotropy/aspect ratio at the real features
+    (gradation limiting rescales a vertex's full matrix by one scalar, so it
+    cannot change aspect ratio -- only how far the background gets to
+    relax). Returns essentially plateaued past ~2.5-3.0, so this is picked as
+    a reasonably conservative point on that curve rather than the extreme
+    end -- still worth confirming/adjusting per case rather than assuming,
+    especially once real adapted meshes exist to check element quality
+    against.
     """
     hmin, hmax = case_config["hmin"], case_config["hmax"]
     return {
@@ -150,7 +166,7 @@ EXAMPLE_REGION_SPEC = {
         "hmin": 0.0005,
         "hmax": 0.05,
         "background_size": 0.02,
-        "growth_rate": 1.2,
+        "growth_rate": 2.5,
     },
     "regions": [
         {

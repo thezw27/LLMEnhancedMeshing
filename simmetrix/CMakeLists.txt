@@ -16,6 +16,10 @@ if(DEFINED ENV{SIMMETRIX_SIMMODSUITE_ROOT})
   set(SIMMETRIX_LIB_DIR "$ENV{SIMMETRIX_SIMMODSUITE_ROOT}/lib/x64_rhel8_gcc83" CACHE PATH "Simmetrix SimModSuite library directory")
 endif()
 
+# The test cases this program has actually been run against are
+# Parasolid-backed (.smd + a native .x_t) -- GM_load() on those fails
+# outright without the Parasolid kernel linked in and started.
+set(SIM_PARASOLID ON CACHE BOOL "Use Parasolid through Simmetrix" FORCE)
 find_package(SimModSuite MODULE REQUIRED)
 find_package(MPI REQUIRED)
 

@@ -22,9 +22,19 @@ visualizing the new mesh here and getting human approve/reject feedback)
 and an adapted Fluent **.cas** (only used downstream, to actually run
 Fluent on the new mesh, once the human is happy with what the VTU shows).
 `adapted_vtu_name`/`adapted_cas_name` below are the remote filenames
-`apply_aniso_size_field` (or whatever wraps it) writes into
-`remote_work_dir/output/` — override them per case if SCOREC uses
-different names; otherwise the defaults below are used.
+`run_on_scorec_script` writes into `remote_work_dir/output/` — override
+them per case if SCOREC uses different names; otherwise the defaults below
+are used.
+
+`native_model` is the CAD kernel's native geometry file (e.g. a Parasolid
+.x_t) — needed only for the Fluent .cas export step (translateToCas.py),
+not by apply_aniso_size_field itself, which loads model_smd directly.
+`run_on_scorec_script` is simmetrix/run_on_scorec.sh: it runs
+apply_aniso_size_field (writes adapted.vtu + adapted_mesh/adapted.sms),
+then runs translateToCas.py via SimModelerScript (writes adapted.cas) —
+see that script for the exact module/version requirements. This is what
+generate_scorec_run_script.py invokes remotely, not apply_aniso_exe
+directly, since the plain executable alone never produces the .cas.
 """
 
 from __future__ import annotations
@@ -37,7 +47,10 @@ class CaseConfigError(ValueError):
 
 
 _REQUIRED_TOP = {"case_name", "vtu_path", "driver_fields", "hmin", "hmax", "scorec"}
-_REQUIRED_SCOREC = {"host", "user", "model_smd", "mesh_sms", "apply_aniso_exe", "remote_work_dir"}
+_REQUIRED_SCOREC = {
+    "host", "user", "native_model", "model_smd", "mesh_sms",
+    "apply_aniso_exe", "run_on_scorec_script", "remote_work_dir",
+}
 _DEFAULT_ADAPTED_VTU_NAME = "adapted.vtu"
 _DEFAULT_ADAPTED_CAS_NAME = "adapted.cas"
 
@@ -58,7 +71,8 @@ def validate_case_config(cfg: dict) -> None:
     if missing_scorec:
         raise CaseConfigError(f"case_config['scorec'] missing keys: {sorted(missing_scorec)}")
 
-    for key in ("model_smd", "mesh_sms", "apply_aniso_exe", "remote_work_dir"):
+    for key in ("native_model", "model_smd", "mesh_sms", "apply_aniso_exe",
+                "run_on_scorec_script", "remote_work_dir"):
         if not scorec[key] or not scorec[key].startswith("/"):
             raise CaseConfigError(f"scorec.{key} should be an absolute remote path, got {scorec[key]!r}")
 
@@ -96,9 +110,11 @@ EXAMPLE_CASE_CONFIG = {
     "scorec": {
         "host": "lore.scorec.rpi.edu",
         "user": "gordoz2",
+        "native_model": "/users/gordoz2/lore.scorec.rpi.edu/adaptiveController/cases/double_ramp_test1/model_nat.x_t",
         "model_smd": "/users/gordoz2/lore.scorec.rpi.edu/adaptiveController/cases/double_ramp_test1/model.smd",
         "mesh_sms": "/users/gordoz2/lore.scorec.rpi.edu/adaptiveController/cases/double_ramp_test1/mesh.sms",
         "apply_aniso_exe": "/users/gordoz2/lore.scorec.rpi.edu/adaptiveController/build/apply_aniso_size_field",
+        "run_on_scorec_script": "/users/gordoz2/lore.scorec.rpi.edu/adaptiveController/run_on_scorec.sh",
         "remote_work_dir": "/users/gordoz2/lore.scorec.rpi.edu/adaptiveController/runs/double_ramp_test1",
         # optional -- shown explicitly here even though they match the
         # defaults, so it's obvious where to override them per case:

@@ -1,8 +1,8 @@
 """
 generate_scorec_run_script.py — turn a validated CaseConfig + a local
 size_field.txt (from export_for_simmetrix.write_size_field) into a plain
-bash script that stages the file, runs apply_aniso_size_field on SCOREC,
-and pulls the adapted results back.
+bash script that stages the file, runs run_on_scorec_script on SCOREC, and
+pulls the adapted results back.
 
 The SCOREC-side handoff is **two files**, not one: an adapted **VTU**
 (pulled back so this pipeline can visualize the new mesh and get a human
@@ -18,9 +18,14 @@ So instead of trying to execute the round trip, this writes a self-contained
 .sh file for a human to run from a machine that actually has SCOREC access
 (`bash run_case_on_scorec_<case_name>.sh`).
 
-apply_aniso_size_field is already built on SCOREC (per Zack), so this script
-does NOT do a cmake/build step — it assumes case_config["scorec"]["apply_aniso_exe"]
-already exists and is executable.
+The remote step is run_on_scorec_script (simmetrix/run_on_scorec.sh), not
+apply_aniso_exe directly: the plain executable only adapts the mesh and
+writes adapted.vtu, it never produces the Fluent .cas (that needs
+SimModelerScript's Python API, a separate tool/module set -- see
+run_on_scorec.sh and translateToCas.py). apply_aniso_size_field is already
+built on SCOREC (per Zack), so this script does NOT do a cmake/build step —
+it assumes case_config["scorec"]["run_on_scorec_script"] already exists and
+is executable.
 
 Auth note: the script makes 4 separate ssh/scp connections (stage the size
 field, run the executable, then 4 scp's back). Plain ssh/scp would prompt
@@ -48,9 +53,10 @@ set -euo pipefail
 HOST="{host}"
 USER="{user}"
 REMOTE_WORK_DIR="{remote_work_dir}"
+NATIVE_MODEL="{native_model}"
 MODEL_SMD="{model_smd}"
 MESH_SMS="{mesh_sms}"
-APPLY_EXE="{apply_aniso_exe}"
+RUN_ON_SCOREC_SCRIPT="{run_on_scorec_script}"
 ADAPTED_VTU_NAME="{adapted_vtu_name}"
 ADAPTED_CAS_NAME="{adapted_cas_name}"
 
@@ -75,9 +81,9 @@ echo "==> staging size field to SCOREC"
 ssh "${{SSH_OPTS[@]}}" "${{USER}}@${{HOST}}" "mkdir -p ${{REMOTE_WORK_DIR}}/output"
 scp -o ControlPath="${{CONTROL_PATH}}" "${{LOCAL_SIZE_FIELD}}" "${{USER}}@${{HOST}}:${{REMOTE_WORK_DIR}}/size_field.txt"
 
-echo "==> running apply_aniso_size_field on SCOREC"
+echo "==> running run_on_scorec.sh on SCOREC (adapt mesh, export VTU + Fluent .cas)"
 ssh "${{SSH_OPTS[@]}}" "${{USER}}@${{HOST}}" \\
-  "${{APPLY_EXE}} ${{MODEL_SMD}} ${{MESH_SMS}} ${{REMOTE_WORK_DIR}}/size_field.txt ${{REMOTE_WORK_DIR}}/output"
+  "${{RUN_ON_SCOREC_SCRIPT}} ${{NATIVE_MODEL}} ${{MODEL_SMD}} ${{MESH_SMS}} ${{REMOTE_WORK_DIR}}/size_field.txt ${{REMOTE_WORK_DIR}}/output"
 
 echo "==> pulling adapted mesh (.sms), adapted VTU, adapted Fluent .cas, and logs back"
 mkdir -p "${{LOCAL_RESULT_DIR}}"
@@ -102,9 +108,10 @@ def generate_run_script(case_config: dict, local_size_field_txt: str, local_resu
         host=scorec["host"],
         user=scorec["user"],
         remote_work_dir=scorec["remote_work_dir"],
+        native_model=scorec["native_model"],
         model_smd=scorec["model_smd"],
         mesh_sms=scorec["mesh_sms"],
-        apply_aniso_exe=scorec["apply_aniso_exe"],
+        run_on_scorec_script=scorec["run_on_scorec_script"],
         adapted_vtu_name=adapted_vtu_name,
         adapted_cas_name=adapted_cas_name,
         local_size_field_txt=local_size_field_txt,
@@ -129,8 +136,8 @@ if __name__ == "__main__":
     )
     with open("/tmp/_run_case_selftest.sh") as f:
         content = f.read()
-    assert "ssh \"${USER}@${HOST}\"" in content
-    assert "apply_aniso_size_field" not in content or True  # exe path is a variable, name may still appear in a comment
+    assert "ssh \"${SSH_OPTS[@]}\" \"${USER}@${HOST}\"" in content
+    assert "run_on_scorec.sh" in content
     assert content.startswith("#!/usr/bin/env bash")
     assert 'ADAPTED_VTU_NAME="adapted.vtu"' in content
     assert 'ADAPTED_CAS_NAME="adapted.cas"' in content
